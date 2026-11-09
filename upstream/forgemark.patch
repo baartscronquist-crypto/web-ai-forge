@@ -1,0 +1,2766 @@
+diff --git a/assets/forgemark-skill/SKILL.md b/assets/forgemark-skill/SKILL.md
+--- a/assets/forgemark-skill/SKILL.md
++++ b/assets/forgemark-skill/SKILL.md
+@@ -23,8 +23,9 @@
+ | --- | --- |
+ | `forgemark list <file> [--unresolved] [--orphaned] [--json]` | Every comment, one per entry: id, kind, open/resolved, attached/orphaned/floating, author, anchor, first line, reply count. |
+ | `forgemark show <file> <id> [--json]` | One thread in full: anchor and its context, the body, every reply in order, any suggested edit. |
++| `forgemark suggest-formula <file> <comment-id> --author NAME --suggest "new TeX" [--body "…"]` | Stage a replacement of the exact LaTeX expression selected in a formula comment. It writes a pending suggestion, not the edit. |
+ | `forgemark comment <file> --author NAME --anchor "passage" --body "…"` | Comment on a passage. Quote it as a reader sees it; line breaks, inline formatting (`**`, backticks), link syntax and backslash escapes (`\<`, `\[`, `\_`) are ignored when matching. A passage in a Markdown file's front matter gets a comment without markers. |
+-| `forgemark comment <file> --author NAME --anchor "passage" --suggest "replacement" [--body "…"]` | Suggest an edit: the reviewer can accept it in one click. `--body` is optional here. |
++| `forgemark comment <file> --author NAME --anchor "passage" --suggest "replacement" [--body "…"] [--thread ID]` | Create a pending suggestion. `--thread` links it to its original discussion. |
+ | `forgemark comment <file> --author NAME --selector "#fig-3" --body "…"` | HTML only: comment on a whole figure, chart, or table by its `id`. |
+ | `forgemark comment <file> --author NAME --floating --body "…"` | A note on the document as a whole, with no anchor. |
+ | `forgemark reply <file> <id> --author NAME --body "…"` | Reply to a thread. Replies are append-only; there is no command to edit or remove one, so add a new reply rather than trying to change an old one. |
+@@ -47,6 +48,8 @@
+ ## Workflows
+ 
+ **Read the review.** `forgemark list <file>` first; then `forgemark show <file> <id>` for the threads you will act on. Filter with `--unresolved` when the file has many.
++
++**Review a formula.** `show --json` gives the LaTeX and `formula_location` (UTF-16 start/end offsets, with one-based line and column). Use `suggest-formula` for an approved-in-the-app proposal. It refuses a stale or ambiguous source range; leave a reply instead of guessing where to edit. Formula comments have no markers inside the LaTeX.
+ 
+ **Address a comment.** `show` it, edit the document's prose with your usual editing tools, then `forgemark reply <file> <id> --author NAME --body "…"` saying what you changed, then `forgemark lint <file>`. Don't `resolve` unless the user asked; the reviewer decides when a thread is done.
+ 
+@@ -121,7 +124,7 @@
+ | `resolved` | yes | Boolean. Resolved threads stay in the file. |
+ | `body` | plain comments | Text. Optional for a suggestion. |
+ | `replies` | optional | List of `{author, timestamp, body, edited_at?}` in chronological order. One `replies:` key per record — append to the list, never add a second key. |
+-| `suggested_edit` | optional | `{from, to}`. `from` is the exact source between the markers; accepting replaces it with `to` and removes the comment and its markers. |
++| `suggested_edit` | optional | `{from, to}`. Accepting replaces the exact anchored source with `to` and archives the proposal. |
+ | `floating` | optional | `true` means no markers and no anchor. |
+ | `anchor_frontmatter` | optional | With `floating: true`: a comment on the Markdown front matter, on the passage `anchor_text` quotes. Never put markers inside front matter. |
+ 
+@@ -129,5 +132,5 @@
+ 
+ **Escapes.** Inside the block, `-->` is written `--\>` and `<!--` is written `<!\--`; the app reverses this on read. You will see these in files; the tool writes them for you.
+ 
+-**Accept and reject** of a suggestion are terminal: both remove the record and the markers; accept also replaces the text. **Delete** removes the record and the markers. **Resolve** only flips the flag.
++**Accept and reject** are reviewer actions. They retire the markers and preserve the proposal, replies, decision, reviewer, and time in Review History. Accept also replaces the text. **Delete** removes an unarchived record and its markers, unless it is linked from a suggestion. **Resolve** only flips the flag on an active thread.
+ 
+diff --git a/cli/lib.ts b/cli/lib.ts
+--- a/cli/lib.ts
++++ b/cli/lib.ts
+@@ -15,6 +15,7 @@
+ import { applyPlacement, locateAnchor, locateElement, AnchorError, type Placement } from "./anchor";
+ import { scopeOfPlacement } from "../src/format/locate";
+ import { spansBlocks } from "../src/format/anchor-text";
++import { applyFormulaSuggestion, formulaAnchor, formulaSpans, resolveFormulaAnchor } from "../src/format/formulaAnchors";
+ import {
+   findFrontmatterPassage,
+   frontmatterFields,
+@@ -31,6 +32,37 @@
+ }
+ 
+ export type Result = { file: ParsedFile; summary: string; id: number };
++
++export function suggestFormula(
++  file: ParsedFile,
++  id: number,
++  input: { author: string; body?: string; replacement: string; now: string },
++): Result {
++  const original = file.comments.find((c) => c.id === id && !c.review_status);
++  const target = original ? resolveFormulaAnchor(file.body, original) : null;
++  if (!original || !target) throw new CommandError("No exact live formula anchor for this comment.");
++  const suggestionId = nextCommentId(file.comments);
++  const suggestion: Comment = {
++    id: suggestionId,
++    floating: true,
++    anchor_text: original.anchor_text,
++    formula_anchor: original.formula_anchor,
++    review_parent_id: id,
++    author: input.author,
++    body: input.body,
++    timestamp: input.now,
++    resolved: false,
++    suggested_edit: { from: target.tex, to: input.replacement },
++  };
++  if (input.replacement === target.tex || applyFormulaSuggestion(file.body, suggestion) === null) {
++    throw new CommandError("Provide changed LaTeX that preserves the formula's delimiters and exact anchor.");
++  }
++  return {
++    file: { body: file.body, comments: [...file.comments, suggestion] },
++    summary: "Proposed formula suggestion #" + suggestionId + " on comment #" + id + "; awaiting human approval.",
++    id: suggestionId,
++  };
++}
+ 
+ export type CommentInput = {
+   author: string;
+@@ -42,6 +74,7 @@
+   occurrence?: number;
+   // Makes it a suggestion: the anchored text is `from`, this is `to`.
+   suggest?: string;
++  reviewParentId?: number;
+   now: string;
+ };
+ 
+@@ -55,6 +88,12 @@
+   if (input.suggest !== undefined && input.anchor === undefined) {
+     throw new CommandError("--suggest needs --anchor: a suggestion replaces the anchored text.");
+   }
++  if (input.reviewParentId !== undefined) {
++    const parent = file.comments.find((c) => c.id === input.reviewParentId);
++    if (input.suggest === undefined || !parent || parent.suggested_edit) {
++      throw new CommandError("--thread must name an existing discussion comment for a suggestion.");
++    }
++  }
+   const body = input.body?.trim() ? input.body : undefined;
+   if (body === undefined && input.suggest === undefined) {
+     throw new CommandError("A comment needs a body (--body, --body-file, or stdin).");
+@@ -68,6 +107,7 @@
+     resolved: false,
+   };
+   if (body !== undefined) record.body = ensureNewline(body);
++  if (input.reviewParentId !== undefined) record.review_parent_id = input.reviewParentId;
+ 
+   if (input.floating) {
+     record.floating = true;
+@@ -132,6 +172,7 @@
+   input: { author: string; body: string; now: string },
+ ): Result {
+   const target = find(file, id);
++  if (target.review_status) throw new CommandError(`#${id} is an archived review decision.`);
+   if (!input.body.trim()) throw new CommandError("A reply needs a body.");
+   const reply: Reply = {
+     author: input.author,
+@@ -150,7 +191,8 @@
+ }
+ 
+ export function setResolved(file: ParsedFile, id: number, resolved: boolean): Result {
+-  find(file, id);
++  const target = find(file, id);
++  if (target.review_status) throw new CommandError(`#${id} is an archived review decision.`);
+   const comments = file.comments.map((c) => (c.id === id ? { ...c, resolved } : c));
+   return {
+     file: { body: file.body, comments },
+@@ -160,7 +202,10 @@
+ }
+ 
+ export function deleteComment(file: ParsedFile, id: number): Result {
+-  find(file, id);
++  const target = find(file, id);
++  if (target.review_status || file.comments.some((c) => c.review_parent_id === id)) {
++    throw new CommandError(`#${id} is retained as part of the review history.`);
++  }
+   return {
+     file: {
+       body: removeMarkersFromBody(file.body, id),
+@@ -175,11 +220,12 @@
+ // cleared, the way the app's Reattach dialog does it.
+ export function floatComment(file: ParsedFile, id: number): Result {
+   const target = find(file, id);
+-  if (target.floating) throw new CommandError(`#${id} is already a floating note.`);
++  if (target.floating && !formulaAnchor(target)) throw new CommandError(`#${id} is already a floating note.`);
+   const comments = file.comments.map((c) => {
+     if (c.id !== id) return c;
+     const next: Comment = { ...c, floating: true };
+     delete next.anchor_text;
++    delete next.formula_anchor;
+     delete next.anchor_kind;
+     delete next.anchor_selector;
+     delete next.anchor_scope;
+@@ -201,7 +247,8 @@
+   id: number,
+   input: { anchor?: string; selector?: string; occurrence?: number },
+ ): Result {
+-  find(file, id);
++  const target = find(file, id);
++  if (target.review_status) throw new CommandError(`#${id} is an archived review decision.`);
+   const { pairs } = pairMarkers(findMarkers(file.body, format));
+   if (pairs.some((p) => p.id === id)) {
+     throw new CommandError(`#${id} is already anchored. Delete it or float it first to move it.`);
+@@ -215,6 +262,7 @@
+     if (c.id !== id) return c;
+     const next: Comment = { ...c };
+     delete next.floating;
++    delete next.formula_anchor;
+     delete next.anchor_kind;
+     delete next.anchor_selector;
+     delete next.anchor_scope;
+@@ -256,10 +304,13 @@
+   status: AnchorStatus["kind"] | "frontmatter";
+   // What currently sits between the markers, for attached comments.
+   current?: string;
++  formulaLocation?: { from: number; to: number; line: number; column: number };
+ };
+ 
+ export function listComments(file: ParsedFile, format: DocFormat): Listed[] {
+   const status = classifyAnchors(file.body, file.comments, format);
++  const formulas = format === "markdown" && file.comments.some(formulaAnchor)
++    ? formulaSpans(file.body) : [];
+   return file.comments.map((comment) => {
+     const st = status.get(comment.id) ?? { kind: "floating" as const };
+     if (isFrontmatterComment(comment)) {
+@@ -271,6 +322,15 @@
+       };
+     }
+     const entry: Listed = { comment, status: st.kind };
++    if (format === "markdown" && formulaAnchor(comment)) {
++      const location = resolveFormulaAnchor(file.body, comment, formulas);
++      if (location) {
++        const { from, to, line, column, tex } = location;
++        entry.current = tex;
++        entry.formulaLocation = { from, to, line, column };
++      }
++      return entry;
++    }
+     if (st.kind === "attached") {
+       const { pairs } = pairMarkers(findMarkers(file.body, format));
+       const pair = pairs.find((p) => p.id === comment.id);
+diff --git a/cli/lint.ts b/cli/lint.ts
+--- a/cli/lint.ts
++++ b/cli/lint.ts
+@@ -18,6 +18,7 @@
+ import { anchorTextMatches, inMarkdownTable } from "../src/format/anchor-text";
+ import { findFrontmatterPassage, frontmatterLength } from "../src/format/frontmatterAnchor";
+ import { wrapsSameElement } from "../src/format/locate";
++import { resolveFormulaAnchor } from "../src/format/formulaAnchors";
+ import { BLOCK_OPEN, type DocFormat, type ParsedFile } from "../src/format/types";
+ 
+ export type Problem = {
+@@ -122,6 +123,20 @@
+         line,
+         message: `Comment ${c.id}: timestamp "${c.timestamp}" is not ISO 8601 UTC (e.g. 2026-05-07T14:32:00Z).`,
+       });
++    }
++
++    if (c.formula_anchor && !c.review_status && format === "markdown") {
++      if (resolveFormulaAnchor(file.body, c)) counts.attached++;
++      else {
++        counts.orphaned++;
++        problems.push({
++          severity: "warning",
++          commentId: c.id,
++          line,
++          message: "Formula comment #" + c.id + " no longer has a unique unchanged LaTeX source range.",
++        });
++      }
++      continue;
+     }
+ 
+     if (c.floating && c.anchor_frontmatter) {
+diff --git a/cli/run.ts b/cli/run.ts
+--- a/cli/run.ts
++++ b/cli/run.ts
+@@ -15,6 +15,7 @@
+ import {
+   addComment,
+   addReply,
++  suggestFormula,
+   setResolved,
+   deleteComment,
+   floatComment,
+@@ -42,6 +43,7 @@
+ Usage:
+   forgemark list <file> [--unresolved] [--orphaned] [--json]
+   forgemark show <file> <id> [--json]
++  forgemark suggest-formula <file> <comment-id> --suggest "new TeX" --author NAME
+   forgemark comment <file> --anchor "passage" [--occurrence N] --body "…"
+   forgemark comment <file> --anchor "passage" --suggest "replacement" [--body "…"]
+   forgemark comment <file> --selector "#fig-3" --body "…"        (HTML: whole element)
+@@ -60,6 +62,8 @@
+                       or add --occurrence N.
+   --selector SEL      HTML only: wrap a whole element by id ("#fig-3" or "#fig-3 table").
+   --suggest TEXT      Make the comment a suggested edit replacing the anchored text.
++  --thread ID         Link a suggestion to its original discussion comment.
++  --review-state      list: pending, accepted, or rejected suggestions.
+   --all               reattach: put back every orphaned comment that can be placed for certain —
+                       by its element's id, or by its text where that appears once, or where
+                       the recorded surroundings pick one copy. The rest stay orphaned, each
+@@ -82,6 +86,8 @@
+   "selector",
+   "occurrence",
+   "suggest",
++  "thread",
++  "review-state",
+ ]);
+ const BOOL_FLAGS = new Set([
+   "json",
+@@ -228,6 +234,13 @@
+   if (flags.unresolved) shown = shown.filter((e) => !e.comment.resolved);
+   if (flags.resolved) shown = shown.filter((e) => e.comment.resolved);
+   if (flags.orphaned) shown = shown.filter((e) => e.status === "orphaned");
++  const decision = str(flags, "review-state");
++  if (decision !== undefined) {
++    if (decision !== "pending" && decision !== "accepted" && decision !== "rejected") {
++      throw new UsageError("--review-state must be pending, accepted, or rejected.");
++    }
++    shown = shown.filter((e) => e.comment.suggested_edit && (e.comment.review_status ?? "pending") === decision);
++  }
+ 
+   if (flags.json) {
+     console.log(
+@@ -246,7 +259,7 @@
+       : c.floating && !c.anchor_frontmatter
+         ? "note"
+         : "comment";
+-    const state = c.resolved ? "resolved" : "open";
++    const state = c.review_status ?? (c.resolved ? "resolved" : "open");
+     const head = [`#${c.id}`, kind, state, e.status, c.author, c.timestamp.slice(0, 10)].join("  ");
+     console.log(head);
+     if (c.anchor_text) console.log(`    on: ${quote(c.anchor_text)}`);
+@@ -282,6 +295,8 @@
+   console.log(
+     `${kind} #${c.id} by ${c.author} at ${c.timestamp} — ${c.resolved ? "resolved" : "open"}, ${entry.status}`,
+   );
++  if (c.review_status) console.log(`Decision: ${c.review_status} by ${c.reviewed_by} at ${c.reviewed_at}`);
++  if (c.review_parent_id !== undefined) console.log(`Original thread: #${c.review_parent_id}`);
+   if (c.anchor_text !== undefined) console.log(`Anchor: ${quote(c.anchor_text)}`);
+   if (entry.current !== undefined && entry.current.replace(/\s+/g, " ").trim() !== c.anchor_text) {
+     console.log(`Currently between the markers: ${quote(entry.current)}`);
+@@ -304,6 +319,7 @@
+   const { additionalKeys, ...rest } = e.comment;
+   const out: Record<string, unknown> = { ...rest, ...(additionalKeys ?? {}), status: e.status };
+   if (e.current !== undefined) out.current_text = e.current;
++  if (e.formulaLocation !== undefined) out.formula_location = e.formulaLocation;
+   return out;
+ }
+ 
+@@ -372,6 +388,7 @@
+         floating: flags.floating === true,
+         occurrence: occurrence(flags),
+         suggest: str(flags, "suggest"),
++        reviewParentId: flags.thread === undefined ? undefined : needId([str(flags, "thread") ?? ""], 0),
+         now: nowIso(),
+       });
+       saveDocument(doc, result.file);
+@@ -384,6 +401,18 @@
+       const body = bodyText(flags);
+       if (body === undefined) throw new UsageError("A reply needs --body or --body-file.");
+       const result = addReply(doc.file, id, { author: needAuthor(flags), body, now: nowIso() });
++      saveDocument(doc, result.file);
++      report(result, flags);
++      return EXIT_OK;
++    }
++    case "suggest-formula": {
++      const doc = loadDocument(needFile(positional));
++      if (doc.format !== "markdown") throw new UsageError("Formula suggestions require Markdown.");
++      const replacement = str(flags, "suggest");
++      if (replacement === undefined) throw new UsageError("Provide the replacement LaTeX with --suggest.");
++      const result = suggestFormula(doc.file, needId(positional, 1), {
++        author: needAuthor(flags), body: bodyText(flags), replacement, now: nowIso(),
++      });
+       saveDocument(doc, result.file);
+       report(result, flags);
+       return EXIT_OK;
+diff --git a/docs/format.md b/docs/format.md
+--- a/docs/format.md
++++ b/docs/format.md
+@@ -106,8 +106,9 @@
+ - **Reply**: append to the record's `replies`.
+ - **Resolve** and **reopen**: set `resolved`. Nothing else changes.
+ - **Delete**: remove the record and its markers.
+-- **Accept a suggestion**: replace the source between the markers with `to`, then remove the markers and the record.
+-- **Reject a suggestion**: remove the markers and the record, leaving the text as it was.
++- **Accept a suggestion**: replace the anchored source with `to` and remove the active markers. The suggestion and replies remain in Review History.
++- **Reject a suggestion**: remove the active markers and leave the text as it was. The suggestion and replies remain in Review History.
++- **Review history**: finalized records carry `review_status: accepted` or `rejected`, `reviewed_at`, and `reviewed_by`. They are resolved and floating so a retired marker is never mistaken for a lost anchor. A proposal may carry `review_parent_id` to identify the original discussion thread in the same file.
+ - **Float**: remove the markers, set `floating: true`, and drop the anchor fields (`anchor_text`, `anchor_kind`, `anchor_selector`, `anchor_scope` and the context). The body and replies stay.
+ 
+ ## Reading a damaged file
+diff --git a/scripts/build-skill.mjs b/scripts/build-skill.mjs
+--- a/scripts/build-skill.mjs
++++ b/scripts/build-skill.mjs
+@@ -81,7 +81,9 @@
+   // Pinned to the DOS epoch (zip dates start in 1980; an earlier date
+   // wraps to 2098 and trips strict readers); jszip otherwise reads file
+   // mtime, which breaks byte-determinism across machines.
+-  const epoch = new Date(1980, 0, 1);
++  // JSZip writes UTC fields. One day of margin also keeps the local date
++  // inside the ZIP era when a reader is west of UTC.
++  const epoch = new Date(Date.UTC(1980, 0, 2));
+   for (const full of files) {
+     const rel = relative(SRC, full).split(sep).join("/");
+     const data = readFileSync(full);
+diff --git a/src/components/AppShell.tsx b/src/components/AppShell.tsx
+--- a/src/components/AppShell.tsx
++++ b/src/components/AppShell.tsx
+@@ -14,6 +14,7 @@
+ import { EditDuringOpenModal } from "./EditDuringOpenModal";
+ import { SaveConflictModal } from "./SaveConflictModal";
+ import { UnsavedChangesModal } from "./UnsavedChangesModal";
++import { VersionHistoryDialog } from "./VersionHistoryDialog";
+ import { SettingsModal } from "./SettingsModal";
+ import { CleanExportModal } from "./CleanExportModal";
+ import { PrintDocument } from "./PrintDocument";
+@@ -42,6 +43,7 @@
+   const { workspace, dispatch: workspaceDispatch } = useWorkspace();
+   useRecentFilesMenu();
+   const [sidebarOpen, setSidebarOpen] = useState(true);
++  const [versionsOpen, setVersionsOpen] = useState(false);
+   const [settingsOpen, setSettingsOpen] = useState(false);
+   const [cleanExportOpen, setCleanExportOpen] = useState(false);
+   const [printOptionsOpen, setPrintOptionsOpen] = useState(false);
+@@ -249,6 +251,7 @@
+         onViewModeChange={requestViewModeChange}
+         sidebarOpen={sidebarOpen}
+         onToggleSidebar={() => setSidebarOpen((s) => !s)}
++        onOpenVersions={state.filePath ? () => setVersionsOpen(true) : undefined}
+         onOpenSettings={() => setSettingsOpen(true)}
+         documentWidth={documentWidth}
+         onDocumentWidthChange={setDocumentWidth}
+@@ -259,6 +262,17 @@
+       <UpdateBanner />
+       <ErrorBanner />
+       <UndoDeleteBanner />
++      {versionsOpen && state.filePath && (
++        <VersionHistoryDialog
++          key={state.filePath}
++          state={state}
++          onClose={() => setVersionsOpen(false)}
++          onRestore={(text, expected) => {
++            dispatch({ type: "restoreVersion", text, expected });
++            setVersionsOpen(false);
++          }}
++        />
++      )}
+       {/* Phase 10 — file-conflict surfaces. The banner shows when the
+           file changed on disk but we have no unsaved work; the
+           edit-during-open modal blocks when there *is* unsaved work; the
+diff --git a/src/components/EditorPane.tsx b/src/components/EditorPane.tsx
+--- a/src/components/EditorPane.tsx
++++ b/src/components/EditorPane.tsx
+@@ -13,6 +13,8 @@
+ import { HtmlView, type HtmlCapturedSelection, type HtmlViewHandle } from "./HtmlView";
+ import { SourceView, type SourceViewHandle } from "./SourceView";
+ import { NewCommentComposer } from "./NewCommentComposer";
++import { FormulaCommentDialog } from "./FormulaCommentDialog";
++import { formulaAnchor, formulaCommentFields, resolveFormulaAnchor, type FormulaSpan } from "../format/formulaAnchors";
+ import { SelectionToolbar } from "./SelectionToolbar";
+ import { FrontmatterBlock } from "./FrontmatterBlock";
+ import { frontmatterFields, frontmatterPlacementAt } from "../format/frontmatterAnchor";
+@@ -137,6 +139,13 @@
+   // nothing to type into.
+   const isHtml = state.format === "html";
+   const [author] = useAuthorName();
++  const [formulaReview, setFormulaReview] = useState<{ formula: FormulaSpan; body: string } | null>(null);
++  const formulaSourceRef = useRef({ body: state.body, comments: state.comments });
++  formulaSourceRef.current = { body: state.body, comments: state.comments };
++  const formulaComments = useMemo(
++    () => state.comments.filter((comment) => formulaAnchor(comment) && !comment.review_status),
++    [state.comments],
++  );
+   const handleRef = useRef<RenderedViewHandle | null>(null);
+   const htmlRef = useRef<HtmlViewHandle | null>(null);
+   const sourceRef = useRef<SourceViewHandle | null>(null);
+@@ -741,6 +750,14 @@
+   useEffect(() => {
+     if (state.viewMode !== "source") return;
+     if (state.focusedCommentId == null) return;
++    const { body, comments } = formulaSourceRef.current;
++    const comment = comments.find((c) => c.id === state.focusedCommentId);
++    if (comment?.formula_anchor) {
++      const location = resolveFormulaAnchor(body, comment);
++      const editorOffset = (pos: number) => body.slice(0, pos).replace(/\r\n?/g, "\n").length;
++      if (location) sourceRef.current?.scrollToFormula(editorOffset(location.from), editorOffset(location.to));
++      return;
++    }
+     sourceRef.current?.scrollToMarker(state.focusedCommentId);
+   }, [state.viewMode, state.focusedCommentId]);
+ 
+@@ -966,6 +983,19 @@
+               onExternalLinkError={(message) => dispatch({ type: "error", message })}
+               baseDir={dirOf(state.filePath)}
+               handleRef={handleRef}
++              formulaComments={formulaComments}
++              onFormulaClick={
++                isActive && !state.readOnly
++                  ? (formula) => {
++                      if (formula) {
++                        setSelectionAffordance(null);
++                        setFormulaReview({ formula, body: state.body });
++                      } else {
++                        dispatch({ type: "error", message: "The formula could not be mapped to a unique LaTeX source range." });
++                      }
++                    }
++                  : undefined
++              }
+               onSelectionChange={
+                 isActive
+                   ? (captured) => showAffordance(captured && fromMarkdownCapture(captured))
+@@ -975,6 +1005,31 @@
+           </>
+         )}
+       </div>
++      {isActive && state.viewMode === "rendered" && formulaReview && (
++        <FormulaCommentDialog
++          formula={formulaReview.formula}
++          onClose={() => setFormulaReview(null)}
++          onSubmit={(from, to, body) => {
++            setFormulaReview(null);
++            if (state.body !== formulaReview.body) {
++              dispatch({ type: "error", message: "The document changed. Select the formula again." });
++              return;
++            }
++            dispatch({
++              type: "addComment",
++              body: state.body,
++              comment: {
++                id: nextCommentId(state.comments),
++                ...formulaCommentFields(state.body, formulaReview.formula, from, to),
++                author,
++                timestamp: new Date().toISOString(),
++                resolved: false,
++                body,
++              },
++            });
++          }}
++        />
++      )}
+       {isActive &&
+         state.viewMode === "rendered" &&
+         selectionAffordance != null &&
+diff --git a/src/components/FMCard.tsx b/src/components/FMCard.tsx
+--- a/src/components/FMCard.tsx
++++ b/src/components/FMCard.tsx
+@@ -23,6 +23,7 @@
+   //   - "orphaned"  → no markers; show a "lost anchor" pill + Reattach CTA
+   //   - "floating"  → comment has floating: true; show "floating" pill
+   anchorState?: "attached" | "orphaned" | "floating";
++  onOpenOriginal?: () => void;
+   onFocus: () => void;
+   onHover: (entering: boolean) => void;
+   onReply: () => void;
+@@ -56,6 +57,7 @@
+   editing,
+   editingReplyIndex,
+   anchorState = "attached",
++  onOpenOriginal,
+   onFocus,
+   onHover,
+   onReply,
+@@ -72,12 +74,14 @@
+ }: Props) {
+   const isOwn = comment.author === authorName;
+   const isSuggestion = Boolean(comment.suggested_edit);
++  const reviewLabel = comment.review_status === "accepted" ? "Accepted" :
++    comment.review_status === "rejected" ? "Rejected" : undefined;
+   const isOrphan = anchorState === "orphaned";
+   const isFloating = anchorState === "floating";
+   const showCollapsed = comment.resolved && !focused && !replying && !editing;
+ 
+   const onKey = (e: KeyboardEvent<HTMLElement>) => {
+-    if (e.key === "Enter" || e.key === " ") {
++    if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+       e.preventDefault();
+       onFocus();
+     }
+@@ -101,9 +105,10 @@
+         className={className}
+         data-testid={`fm-card-${comment.id}`}
+         data-anchor-card-id={comment.id}
++        data-review-status={comment.review_status}
+         tabIndex={0}
+         aria-current={focused ? "true" : undefined}
+-        aria-label={`Resolved comment by ${comment.author}`}
++        aria-label={`${reviewLabel ?? "Resolved"} comment by ${comment.author}`}
+         onClick={onFocus}
+         onKeyDown={onKey}
+         onMouseEnter={() => onHover(true)}
+@@ -112,9 +117,7 @@
+         <div className="fm-card-collapsed-row">
+           <Avatar name={comment.author} size={18} />
+           <span className="fm-card-collapsed-author">{comment.author}</span>
+-          <span className="fm-card-collapsed-check" aria-hidden>
+-            ✓
+-          </span>
++          <span className="fm-card-collapsed-check">{reviewLabel ?? "✓"}</span>
+           <span className="fm-card-collapsed-preview">{plainPreview(comment, 60)}</span>
+         </div>
+       </article>
+@@ -126,6 +129,7 @@
+       className={className}
+       data-testid={`fm-card-${comment.id}`}
+       data-anchor-card-id={comment.id}
++      data-review-status={comment.review_status ?? (isSuggestion ? "pending" : undefined)}
+       tabIndex={0}
+       aria-current={focused ? "true" : undefined}
+       aria-label={`Comment by ${comment.author}`}
+@@ -151,13 +155,42 @@
+           )}
+         </div>
+       )}
+-      {isFloating && (
++      {comment.formula_anchor && (
++        <div className="fm-card-pill fm-card-pill-floating" title={comment.anchor_text}>
++          LaTeX <code>{truncate(comment.anchor_text ?? "", 60)}</code>
++        </div>
++      )}
++      {isFloating && !reviewLabel && (
+         <div
+           className="fm-card-pill fm-card-pill-floating"
+           data-testid={`fm-card-floating-pill-${comment.id}`}
+         >
+           Floating note
+         </div>
++      )}
++      {isSuggestion && (
++        <div
++          className="fm-card-pill fm-card-pill-floating"
++          data-testid={`fm-card-review-status-${comment.id}`}
++          title={comment.reviewed_at}
++        >
++          {reviewLabel ?? "Pending suggestion"}
++          {reviewLabel && comment.reviewed_by && ` by ${comment.reviewed_by}`}
++        </div>
++      )}
++      {comment.review_parent_id !== undefined && (
++        onOpenOriginal ? (
++          <button
++            type="button"
++            className="fm-btn fm-btn-sm fm-btn-quiet"
++            onClick={(event) => {
++              event.stopPropagation();
++              onOpenOriginal();
++            }}
++          >
++            Original thread #{comment.review_parent_id}
++          </button>
++        ) : <div className="fm-card-body">Original thread #{comment.review_parent_id}</div>
+       )}
+       {editing ? (
+         <InlineComposer
+@@ -187,6 +220,7 @@
+               reply={reply}
+               isOwn={reply.author === authorName}
+               editing={editingReplyIndex === i}
++              readOnly={Boolean(reviewLabel)}
+               onEdit={() => onReplyEdit(i)}
+               onDelete={() => onReplyDelete(i)}
+               onComposerSubmit={onComposerSubmit}
+@@ -204,7 +238,7 @@
+           onCancel={onComposerCancel}
+         />
+       )}
+-      {focused && !editing && !replying && editingReplyIndex === null && (
++      {focused && !reviewLabel && !editing && !replying && editingReplyIndex === null && (
+         <div className="fm-card-actions" role="toolbar" aria-label="Comment actions">
+           {isOrphan ? (
+             <>
+@@ -356,6 +390,7 @@
+   reply,
+   isOwn,
+   editing,
++  readOnly,
+   onEdit,
+   onDelete,
+   onComposerSubmit,
+@@ -364,6 +399,7 @@
+   reply: Reply;
+   isOwn: boolean;
+   editing: boolean;
++  readOnly: boolean;
+   onEdit: () => void;
+   onDelete: () => void;
+   onComposerSubmit: (body: string) => void;
+@@ -388,7 +424,7 @@
+       ) : (
+         <>
+           <div className="fm-card-reply-body">{stripMarkdown(reply.body)}</div>
+-          <div className="fm-card-reply-actions">
++          {!readOnly && <div className="fm-card-reply-actions">
+             {isOwn && (
+               <button
+                 type="button"
+@@ -411,7 +447,7 @@
+             >
+               Delete
+             </button>
+-          </div>
++          </div>}
+         </>
+       )}
+     </li>
+diff --git a/src/components/FormulaCommentDialog.css b/src/components/FormulaCommentDialog.css
+new file mode 100644
+--- /dev/null
++++ b/src/components/FormulaCommentDialog.css
+@@ -0,0 +1,35 @@
++.fm-formula-comment {
++  display: grid;
++  gap: 12px;
++  padding: 18px;
++}
++
++.fm-formula-comment h2,
++.fm-formula-comment p {
++  margin: 0;
++}
++
++.fm-formula-comment label {
++  display: grid;
++  gap: 6px;
++}
++
++.fm-formula-comment textarea {
++  box-sizing: border-box;
++  width: 100%;
++  padding: 8px;
++  resize: vertical;
++}
++
++.fm-formula-comment textarea[readonly],
++.fm-formula-target code {
++  font-family: ui-monospace, monospace;
++  white-space: pre-wrap;
++  overflow-wrap: anywhere;
++}
++
++.fm-formula-comment footer {
++  display: flex;
++  justify-content: flex-end;
++  gap: 8px;
++}
+diff --git a/src/components/FormulaCommentDialog.tsx b/src/components/FormulaCommentDialog.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/components/FormulaCommentDialog.tsx
+@@ -0,0 +1,60 @@
++import { useState } from "react";
++import { Modal } from "./Modal";
++import type { FormulaSpan } from "../format/formulaAnchors";
++import "./FormulaCommentDialog.css";
++
++export function FormulaCommentDialog({
++  formula,
++  onSubmit,
++  onClose,
++}: {
++  formula: FormulaSpan;
++  onSubmit: (from: number, to: number, comment: string) => void;
++  onClose: () => void;
++}) {
++  const [selection, setSelection] = useState<[number, number] | null>(null);
++  const [comment, setComment] = useState("");
++  const [from, to] = selection ?? [0, formula.tex.length];
++  const selectionText = formula.tex.slice(from, to);
++  const readSelection = ({ currentTarget }: { currentTarget: HTMLTextAreaElement }) => {
++    const { selectionStart, selectionEnd } = currentTarget;
++    setSelection(selectionEnd > selectionStart ? [selectionStart, selectionEnd] : null);
++  };
++  return (
++    <Modal labelledBy="fm-formula-comment-title" testId="fm-formula-comment" onClose={onClose}>
++      <form
++        className="fm-formula-comment"
++        onSubmit={(event) => {
++          event.preventDefault();
++          if (comment.trim() && selectionText.trim()) onSubmit(from, to, comment.trim());
++        }}
++      >
++        <h2 id="fm-formula-comment-title">Comment on formula</h2>
++        <p>Select part of the LaTeX below to comment on it. With no selection, the comment covers the whole formula.</p>
++        <label>
++          LaTeX source
++          <textarea
++            readOnly
++            rows={Math.min(12, Math.max(3, formula.tex.split("\n").length + 1))}
++            value={formula.tex}
++            onSelect={readSelection}
++            onPointerUp={readSelection}
++            onKeyUp={readSelection}
++          />
++        </label>
++        <p className="fm-formula-target" aria-live="polite">
++          {selection ? <><strong>Selected:</strong> <code>{selectionText}</code></> : "Whole formula selected"}
++        </p>
++        {selection && <button type="button" onClick={() => setSelection(null)}>Use whole formula</button>}
++        <label>
++          Comment
++          <textarea rows={4} value={comment} onChange={(event) => setComment(event.target.value)} />
++        </label>
++        <footer>
++          <button type="button" onClick={onClose}>Cancel</button>
++          <button type="submit" disabled={!comment.trim() || !selectionText.trim()}>Save comment</button>
++        </footer>
++      </form>
++    </Modal>
++  );
++}
+diff --git a/src/components/Math.ts b/src/components/Math.ts
+--- a/src/components/Math.ts
++++ b/src/components/Math.ts
+@@ -26,6 +26,7 @@
+   for (const [name, value] of Object.entries(attrs)) el.setAttribute(name, value);
+   el.className = displayMode ? "fm-math-block" : "fm-math";
+   el.setAttribute("contenteditable", "false");
++  el.title = "Click to comment on the formula or select its LaTeX source";
+   el.innerHTML = katex.renderToString(tex, { throwOnError: false, displayMode });
+   return el;
+ }
+diff --git a/src/components/RenderedView.css b/src/components/RenderedView.css
+--- a/src/components/RenderedView.css
++++ b/src/components/RenderedView.css
+@@ -428,6 +428,17 @@
+ }
+ 
+ /* Math (KaTeX) and diagrams (Mermaid). */
++.fm-rendered-view .fm-math,
++.fm-rendered-view .fm-math-block {
++  cursor: pointer;
++}
++
++.fm-rendered-view .fm-formula-annotated {
++  outline: 2px solid currentColor;
++  outline-offset: 3px;
++  border-radius: 3px;
++}
++
+ .fm-rendered-view .fm-prose .fm-math-block {
+   margin: 1em 0;
+   overflow-x: auto;
+diff --git a/src/components/RenderedView.tsx b/src/components/RenderedView.tsx
+--- a/src/components/RenderedView.tsx
++++ b/src/components/RenderedView.tsx
+@@ -14,6 +14,8 @@
+ import { createBlockSync, type BlockSync, type Serializer } from "./blockSync";
+ import { renderedExtensions } from "./editorExtensions";
+ import { anchorIdOf } from "../services/anchorDom";
++import { formulaSpans, resolveFormulaAnchor, type FormulaSpan } from "../format/formulaAnchors";
++import type { Comment } from "../format/types";
+ import { isBlockAnchored, nodeText } from "./BlockAnchor";
+ import {
+   TEXTLESS,
+@@ -124,6 +126,8 @@
+   // alike. ProseMirror announces selection changes directly here, so
+   // unlike the report frame this needs no polling.
+   onSelectionChange?: (capture: CapturedSelection | null) => void;
++  formulaComments?: Comment[];
++  onFormulaClick?: (formula: FormulaSpan | null) => void;
+ };
+ 
+ // Phase 4 rendered view. Anchor edges are pre-rendered into the markdown
+@@ -149,6 +153,8 @@
+   baseDir = null,
+   handleRef,
+   onSelectionChange,
++  formulaComments,
++  onFormulaClick,
+ }: Props) {
+   // Front matter never reaches the editor: it would be read as a rule
+   // and a heading, and come back rewritten. It is split off here and put
+@@ -184,7 +190,7 @@
+   onSelectionChangeRef.current = onSelectionChange;
+ 
+   const editor = useEditor({
+-    extensions: renderedExtensions([SearchHighlightExtension], { baseDir }),
++    extensions: renderedExtensions([SearchHighlightExtension, FormulaHighlightExtension], { baseDir }),
+     content: initialMarkdown,
+     editable: !readOnly,
+     // The editor is constructed with the right content already, so it's
+@@ -306,6 +312,19 @@
+         return;
+       }
+       const id = findAnchor(e.target);
++      const formula = e.target instanceof Element
++        ? e.target.closest<HTMLElement>(".fm-math, .fm-math-block")
++        : null;
++      if (formula && onFormulaClick) {
++        const pos = renderedFormulaNodes(editor.state.doc).find((entry) =>
++          editor.view.nodeDOM(entry.pos) === formula,
++        )?.pos;
++        const spans = formulaSpans(body);
++        onFormulaClick(
++          pos === undefined ? null : matchRenderedFormulas(editor.state.doc, spans).get(pos) ?? null,
++        );
++        return;
++      }
+       if (id !== null) {
+         onAnchorClick(id);
+       } else {
+@@ -328,7 +347,34 @@
+       root.removeEventListener("mouseover", onMouseOver);
+       root.removeEventListener("mouseout", onMouseOut);
+     };
+-  }, [editor, baseDir, onAnchorClick, onAnchorHover, onExternalLinkError, onOpenExternalLink]);
++  }, [editor, baseDir, body, onAnchorClick, onAnchorHover, onExternalLinkError, onOpenExternalLink, onFormulaClick]);
++
++  useEffect(() => {
++    if (!editor || editor.isDestroyed) return;
++    const decorations: PMDecoration[] = [];
++    if (formulaComments?.length) {
++      const spans = formulaSpans(body);
++      const matched = matchRenderedFormulas(editor.state.doc, spans);
++      const bySource = new Map([...matched].map(([pos, span]) => [span.start, pos]));
++      const groups = new Map<number, number[]>();
++      for (const comment of formulaComments) {
++        const found = resolveFormulaAnchor(body, comment, spans);
++        const pos = found ? bySource.get(found.span.start) : undefined;
++        if (pos === undefined) continue;
++        groups.set(pos, [...(groups.get(pos) ?? []), comment.id]);
++      }
++      for (const [pos, ids] of groups) {
++        const node = editor.state.doc.nodeAt(pos);
++        if (!node) continue;
++        const chosen = ids.find((id) => id === focusedCommentId || id === hoveredCommentId) ?? ids[0];
++        decorations.push(PMDecoration.node(pos, pos + node.nodeSize, {
++          class: "fm-formula-annotated",
++          "data-anchor-id": String(chosen),
++        }));
++      }
++    }
++    editor.view.dispatch(editor.state.tr.setMeta(formulaHighlightKey, decorations));
++  }, [editor, body, formulaComments, focusedCommentId, hoveredCommentId]);
+ 
+   // The focused and hovered comment light up their highlights. The
+   // classes ride on the highlight decorations themselves: Tiptap owns
+@@ -541,6 +587,52 @@
+ };
+ 
+ const searchPluginKey = new PluginKey<SearchDecorationState>("forgemark-search");
++
++const formulaHighlightKey = new PluginKey<DecorationSet>("forgemark-formula-highlight");
++
++const FormulaHighlightExtension = Extension.create({
++  name: "forgemarkFormulaHighlight",
++  addProseMirrorPlugins() {
++    return [new Plugin<DecorationSet>({
++      key: formulaHighlightKey,
++      state: {
++        init: () => DecorationSet.empty,
++        apply: (tr, previous) => {
++          const decorations = tr.getMeta(formulaHighlightKey) as PMDecoration[] | undefined;
++          return decorations ? DecorationSet.create(tr.doc, decorations) : previous.map(tr.mapping, tr.doc);
++        },
++      },
++      props: { decorations: (state) => formulaHighlightKey.getState(state) },
++    })];
++  },
++});
++
++function renderedFormulaNodes(doc: ProseMirrorNode) {
++  const nodes: { pos: number; kind: FormulaSpan["kind"]; tex: string }[] = [];
++  doc.descendants((node, pos) => {
++    if (node.type.name === "mathInline" || node.type.name === "mathBlock") {
++      nodes.push({ pos, kind: node.type.name === "mathInline" ? "inline" : "display", tex: String(node.attrs.src) });
++    }
++  });
++  return nodes;
++}
++
++function matchRenderedFormulas(doc: ProseMirrorNode, spans: FormulaSpan[]) {
++  const nodes = renderedFormulaNodes(doc);
++  const matched = new Map<number, FormulaSpan>();
++  // Match by kind/TeX and ordered occurrence. If any occurrence could
++  // not be mapped from the raw source, refuse that whole matching group.
++  for (const node of nodes) {
++    if (matched.has(node.pos)) continue;
++    const same = (entry: { kind: FormulaSpan["kind"]; tex: string }) =>
++      entry.kind === node.kind && entry.tex === node.tex;
++    const rendered = nodes.filter(same);
++    const source = spans.filter(same);
++    if (rendered.length !== source.length) continue;
++    rendered.forEach((entry, i) => matched.set(entry.pos, source[i]));
++  }
++  return matched;
++}
+ 
+ const SearchHighlightExtension = Extension.create({
+   name: "forgemarkSearchHighlight",
+diff --git a/src/components/Sidebar.tsx b/src/components/Sidebar.tsx
+--- a/src/components/Sidebar.tsx
++++ b/src/components/Sidebar.tsx
+@@ -13,6 +13,7 @@
+   type AnchorStatus,
+ } from "../format";
+ import { isFrontmatterComment } from "../format/frontmatterAnchor";
++import { applyFormulaSuggestion, formulaAnchor } from "../format/formulaAnchors";
+ import type { Comment, Reply } from "../format/types";
+ import type { FilterMode, SortMode } from "../state/document";
+ import "./Sidebar.css";
+@@ -40,18 +41,20 @@
+     () => sortComments(filterComments(comments, filter, authorName), sort, anchorStatuses),
+     [comments, filter, sort, authorName, anchorStatuses],
+   );
++  const history = visibleComments.filter((c) => c.review_status);
++  const liveComments = visibleComments.filter((c) => !c.review_status);
+ 
+   // Phase 9: split into three groups, preserving sort within each.
+-  const orphans = visibleComments.filter((c) => anchorStatuses.get(c.id)?.kind === "orphaned");
++  const orphans = liveComments.filter((c) => anchorStatuses.get(c.id)?.kind === "orphaned");
+   // A comment on the front matter is stored as a floating note, having
+   // no markers, but it is on a passage: it goes with the attached
+   // comments, first, as the front matter comes first in the document.
+-  const floatingNotes = visibleComments.filter(
++  const floatingNotes = liveComments.filter(
+     (c) => anchorStatuses.get(c.id)?.kind === "floating" && !isFrontmatterComment(c),
+   );
+   const attached = [
+-    ...visibleComments.filter(isFrontmatterComment),
+-    ...visibleComments.filter((c) => anchorStatuses.get(c.id)?.kind === "attached"),
++    ...liveComments.filter(isFrontmatterComment),
++    ...liveComments.filter((c) => anchorStatuses.get(c.id)?.kind === "attached"),
+   ];
+ 
+   const open = comments.filter((c) => !c.resolved).length;
+@@ -84,7 +87,7 @@
+ 
+       if (focusedCommentId == null) return;
+       const c = comments.find((x) => x.id === focusedCommentId);
+-      if (!c) return;
++      if (!c || c.review_status) return;
+       switch (cmd) {
+         case "reply":
+           e.preventDefault();
+@@ -129,7 +132,7 @@
+       />
+       <SidebarHeader
+         orphaned={orphans.length}
+-        openVisibleIds={visibleComments.filter((c) => !c.resolved).map((c) => c.id)}
++        openVisibleIds={liveComments.filter((c) => !c.resolved && !c.suggested_edit).map((c) => c.id)}
+         onResolveAll={(ids) => dispatch({ type: "setResolved", commentIds: ids, resolved: true })}
+         open={open}
+         total={comments.length}
+@@ -171,6 +174,11 @@
+                 {floatingNotes.map((c) => renderCard(c, "floating"))}
+               </CardSection>
+             )}
++            {history.length > 0 && (
++              <CardSection label={`REVIEW HISTORY · ${history.length}`} testid="fm-sidebar-section-history">
++                {history.map((c) => renderCard(c, "floating"))}
++              </CardSection>
++            )}
+           </>
+         )}
+       </div>
+@@ -195,6 +203,17 @@
+           editing={editing}
+           editingReplyIndex={editingReplyIndex}
+           anchorState={anchorState}
++          onOpenOriginal={
++            c.review_parent_id !== undefined && comments.some((x) => x.id === c.review_parent_id)
++              ? () => {
++                  const id = c.review_parent_id!;
++                  if (!visibleComments.some((x) => x.id === id)) {
++                    dispatch({ type: "setFilter", filter: { kind: "all" } });
++                  }
++                  dispatch({ type: "setFocusedComment", id, reveal: true });
++                }
++              : undefined
++          }
+           onFocus={() => dispatch({ type: "setFocusedComment", id: c.id })}
+           onHover={(entering) =>
+             dispatch({
+@@ -224,6 +243,21 @@
+           }}
+           onAcceptSuggestion={() => {
+             if (!c.suggested_edit) return;
++            if (formulaAnchor(c)) {
++              const body = applyFormulaSuggestion(state.body, c);
++              if (body === null) {
++                dispatch({ type: "error", message: "The LaTeX anchor moved, changed, or the replacement would break the formula. Review the source before proposing it again." });
++                return;
++              }
++              dispatch({
++                type: "acceptSuggestion",
++                commentId: c.id,
++                body,
++                reviewedAt: new Date().toISOString(),
++                reviewer: authorName,
++              });
++              return;
++            }
+             // A suggestion across two blocks (one written by hand, or by
+             // an older version) would merge them, or break a table, if
+             // accepted: the replacement is one run of text.
+@@ -262,10 +296,12 @@
+               type: "acceptSuggestion",
+               commentId: c.id,
+               body: result.body,
++              reviewedAt: new Date().toISOString(),
++              reviewer: authorName,
+             });
+           }}
+           onRejectSuggestion={() => {
+-            const newBody = stripAnchoredMarkers(state.body, c.id, state.format);
++            const newBody = formulaAnchor(c) ? state.body : stripAnchoredMarkers(state.body, c.id, state.format);
+             if (newBody == null) {
+               dispatch({
+                 type: "error",
+@@ -277,6 +313,8 @@
+               type: "rejectSuggestion",
+               commentId: c.id,
+               body: newBody,
++              reviewedAt: new Date().toISOString(),
++              reviewer: authorName,
+             });
+           }}
+           onReattach={() => dispatch({ type: "openReattach", commentId: c.id })}
+@@ -450,6 +488,9 @@
+         >
+           <option value="all">All comments</option>
+           <option value="open">Open only</option>
++          <option value="pending">Pending suggestions</option>
++          <option value="accepted">Accepted suggestions</option>
++          <option value="rejected">Rejected suggestions</option>
+           <option value="resolved">Resolved</option>
+           {(authors.includes(authorName) || filter.kind === "byMe") && (
+             <option value="byMe">By me</option>
+@@ -510,6 +551,11 @@
+       return comments.filter((c) => !c.resolved);
+     case "resolved":
+       return comments.filter((c) => c.resolved);
++    case "pending":
++      return comments.filter((c) => c.suggested_edit && !c.review_status);
++    case "accepted":
++    case "rejected":
++      return comments.filter((c) => c.review_status === filter.kind);
+     case "byMe":
+       return comments.filter((c) => c.author === authorName);
+     case "byAuthor":
+@@ -548,8 +594,11 @@
+ }
+ 
+ function valueToFilter(v: string): FilterMode {
+-  if (v === "open" || v === "resolved" || v === "byMe" || v === "all") {
+-    return { kind: v as "all" | "open" | "resolved" | "byMe" } as FilterMode;
++  if (
++    v === "open" || v === "resolved" || v === "byMe" || v === "all" ||
++    v === "pending" || v === "accepted" || v === "rejected"
++  ) {
++    return { kind: v };
+   }
+   if (v.startsWith("byAuthor:")) {
+     return { kind: "byAuthor", author: v.slice("byAuthor:".length) };
+diff --git a/src/components/SourceView.tsx b/src/components/SourceView.tsx
+--- a/src/components/SourceView.tsx
++++ b/src/components/SourceView.tsx
+@@ -46,6 +46,7 @@
+   // view, with a brief flash to draw the eye. No-op if the marker
+   // isn't present in the visible text.
+   scrollToMarker: (id: number) => void;
++  scrollToFormula: (from: number, to: number) => void;
+   captureViewportAnchor: (pane: HTMLElement) => ViewSyncAnchor | null;
+   scrollToViewportAnchor: (anchor: ViewSyncAnchor) => boolean;
+ };
+@@ -238,6 +239,14 @@
+   useImperativeHandle(
+     ref,
+     () => ({
++      scrollToFormula(from: number, to: number) {
++        const view = viewRef.current;
++        if (!view || from < 0 || to > view.state.doc.length) return;
++        view.dispatch({
++          selection: { anchor: from, head: to },
++          effects: EditorView.scrollIntoView(from, { y: "center" }),
++        });
++      },
+       scrollToMarker(id: number) {
+         const view = viewRef.current;
+         if (!view) return;
+diff --git a/src/components/TitleBar.tsx b/src/components/TitleBar.tsx
+--- a/src/components/TitleBar.tsx
++++ b/src/components/TitleBar.tsx
+@@ -10,6 +10,7 @@
+   onViewModeChange: (m: "rendered" | "source") => void;
+   sidebarOpen: boolean;
+   onToggleSidebar: () => void;
++  onOpenVersions?: () => void;
+   // Phase 11: opens the Settings modal. Until the native macOS menu
+   // bar lands, this gear button is the discoverable mouse path.
+   onOpenSettings?: () => void;
+@@ -29,6 +30,7 @@
+   onViewModeChange,
+   sidebarOpen,
+   onToggleSidebar,
++  onOpenVersions,
+   onOpenSettings,
+   documentWidth,
+   onDocumentWidthChange,
+@@ -62,6 +64,11 @@
+           />
+         )}
+         <SidebarToggle open={sidebarOpen} onClick={onToggleSidebar} />
++        {onOpenVersions && (
++          <button type="button" className="fm-btn" onClick={onOpenVersions} aria-label="Open version history">
++            Versions
++          </button>
++        )}
+         {onOpenSettings && <SettingsButton onClick={onOpenSettings} />}
+       </div>
+     </header>
+diff --git a/src/components/VersionHistoryDialog.css b/src/components/VersionHistoryDialog.css
+new file mode 100644
+--- /dev/null
++++ b/src/components/VersionHistoryDialog.css
+@@ -0,0 +1,36 @@
++.fm-version-body {
++  display: grid;
++  gap: 12px;
++}
++
++.fm-version-body p,
++.fm-version-diff h3 {
++  margin: 0;
++}
++
++.fm-version-selectors {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 12px 20px;
++}
++
++.fm-version-selectors label {
++  display: grid;
++  gap: 4px;
++}
++
++.fm-version-diff {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  gap: 12px;
++}
++
++.fm-version-diff pre {
++  max-height: 36vh;
++  overflow: auto;
++  white-space: pre-wrap;
++  overflow-wrap: anywhere;
++  padding: 8px;
++  border: 1px solid var(--fm-border);
++  border-radius: 6px;
++}
+diff --git a/src/components/VersionHistoryDialog.tsx b/src/components/VersionHistoryDialog.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/components/VersionHistoryDialog.tsx
+@@ -0,0 +1,146 @@
++import { useEffect, useMemo, useState } from "react";
++import type { DocumentState } from "../state/document";
++import {
++  readVersionHistory,
++  revertVersionChange,
++  versionBody,
++  versionApprovals,
++  versionIsCommitted,
++  versionDifference,
++  type SavedVersion,
++} from "../services/versionHistory";
++import { Modal } from "./Modal";
++import "./VersionHistoryDialog.css";
++
++type Props = {
++  state: DocumentState;
++  onRestore: (text: string, expected: string) => void;
++  onClose: () => void;
++};
++
++type RestoreMode = "change" | "file";
++
++export function VersionHistoryDialog({ state, onRestore, onClose }: Props) {
++  const [versions, setVersions] = useState<SavedVersion[] | null>(null);
++  const [selected, setSelected] = useState("");
++  const [comparison, setComparison] = useState<"change" | "current">("change");
++  const [confirm, setConfirm] = useState<RestoreMode | null>(null);
++  const [error, setError] = useState("");
++
++  useEffect(() => {
++    if (!state.filePath) return;
++    let active = true;
++    void readVersionHistory(state.filePath)
++      .then((items) => {
++        if (!active) return;
++        setVersions(items);
++        setSelected(items[0]?.id ?? "");
++      })
++      .catch((err: unknown) => {
++        if (active) setError(err instanceof Error ? err.message : String(err));
++      });
++    return () => { active = false; };
++  }, [state.filePath]);
++
++  const approvals = useMemo(
++    () => versions?.flatMap((item) => versionIsCommitted(item, state.originalText, versions) ? versionApprovals(item, state.format) : []) ?? [],
++    [versions, state.format, state.originalText],
++  );
++  const approval = approvals.find((item) => item.id === selected);
++  const version = approval ?? versions?.find((item) => item.id === selected);
++  const committed = version && versionIsCommitted(version, state.originalText, versions ?? []);
++  const before = version ? versionBody(version.before, state.format) : "";
++  const after = version ? versionBody(version.after, state.format) : "";
++  const current = version ? versionBody(state.originalText, state.format) : "";
++  const comparing = comparison === "change" && committed ? "change" : "current";
++  const target = comparing === "change" ? after : current;
++  const diff = versionDifference(before, target);
++  const left = before.slice(Math.max(0, diff.from - 80), diff.from);
++  const right = before.slice(diff.beforeEnd, diff.beforeEnd + 80);
++  const canRestore = !!version && !state.dirty && !state.readOnly && !state.externalChange;
++
++  function restore() {
++    if (!version || !confirm || !canRestore) return;
++    try {
++      const text = confirm === "file"
++        ? version.before
++        : revertVersionChange(state.originalText, version, state.format);
++      onRestore(text, state.originalText);
++    } catch (err) {
++      setError(err instanceof Error ? err.message : String(err));
++      setConfirm(null);
++    }
++  }
++
++  return (
++    <Modal labelledBy="fm-versions-title" testId="fm-versions-dialog" onClose={onClose} width={760}>
++      <header className="fm-modal-header">
++        <h2 id="fm-versions-title" className="fm-modal-title">Version history</h2>
++      </header>
++      <section className="fm-modal-body fm-version-body">
++        {error && <p role="alert">{error}</p>}
++        {!versions && !error && <p>Loading local versions…</p>}
++        {versions?.length === 0 && <p>A backup appears after saving a change to this file.</p>}
++        {version && (
++          <>
++            <div className="fm-version-selectors">
++              <label>
++                Snapshot
++                <select value={selected} onChange={(event) => { setSelected(event.target.value); setConfirm(null); setError(""); }}>
++                  <optgroup label="Saved versions">
++                    {versions!.map((item) => (
++                      <option key={item.id} value={item.id}>{new Date(item.at).toLocaleString()}{versionIsCommitted(item, state.originalText, versions!) ? "" : " · Backup before an unconfirmed save"}</option>
++                    ))}
++                  </optgroup>
++                  {approvals.length > 0 && (
++                    <optgroup label="Individual approvals">
++                      {approvals.map((item) => (
++                        <option key={item.id} value={item.id}>Suggestion #{item.commentId} · {new Date(item.at).toLocaleString()}</option>
++                      ))}
++                    </optgroup>
++                  )}
++                </select>
++              </label>
++              <label>
++                Compare with
++                <select value={comparing} onChange={(event) => setComparison(event.target.value === "current" ? "current" : "change")}>
++                  <option value="change" disabled={!committed}>The next content in this save</option>
++                  <option value="current">Current file</option>
++                </select>
++              </label>
++            </div>
++            {diff.removed || diff.added ? (
++              <div className="fm-version-diff" data-testid="fm-version-diff">
++                <div><h3>Before</h3><pre>{left}<del>{diff.removed || "∅"}</del>{right}</pre></div>
++                <div><h3>{comparing === "change" ? "After" : "Current"}</h3><pre>{left}<ins>{diff.added || "∅"}</ins>{target.slice(diff.afterEnd, diff.afterEnd + 80)}</pre></div>
++              </div>
++            ) : <p>The Markdown body is identical. The saved review records may differ.</p>}
++            {!canRestore && <p>Save or resolve the current file before restoring a version.</p>}
++            {confirm && (
++              <p role="status">
++                {confirm === "file"
++                  ? "Restore the entire snapshot, including its review records? The current file will be backed up first."
++                  : "Reverse this saved body change? The current review records will be retained."}
++              </p>
++            )}
++          </>
++        )}
++      </section>
++      <footer className="fm-modal-footer">
++        <button type="button" className="fm-btn" onClick={onClose}>Close</button>
++        <div className="fm-modal-spacer" />
++        {confirm ? (
++          <>
++            <button type="button" className="fm-btn" onClick={() => setConfirm(null)}>Cancel restore</button>
++            <button type="button" className="fm-btn fm-btn-primary" disabled={!canRestore} onClick={restore}>Confirm restore</button>
++          </>
++        ) : (
++          <>
++            <button type="button" className="fm-btn" disabled={!canRestore || !committed || before === after} onClick={() => { setComparison("change"); setConfirm("change"); }}>Revert this change</button>
++            <button type="button" className="fm-btn" disabled={!canRestore || !!approval || version?.before === state.originalText} onClick={() => { setComparison("current"); setConfirm("file"); }}>Restore entire snapshot</button>
++          </>
++        )}
++      </footer>
++    </Modal>
++  );
++}
+diff --git a/src/format/formulaAnchors.ts b/src/format/formulaAnchors.ts
+new file mode 100644
+--- /dev/null
++++ b/src/format/formulaAnchors.ts
+@@ -0,0 +1,187 @@
++import MarkdownIt from "markdown-it";
++import { splitFrontmatter } from "./frontmatter";
++import { markdownExtras } from "./markdownExtras";
++import type { Comment, FormulaAnchor } from "./types";
++
++export type FormulaSpan = {
++  kind: "inline" | "display";
++  tex: string;
++  start: number;
++  end: number;
++  texStart: number;
++  texEnd: number;
++};
++
++const markdown = new MarkdownIt({ html: true });
++markdownExtras(markdown);
++const normalizeNewlines = (value: string) => value.replace(/\r\n?/g, "\n");
++
++// Map the parser's LF-normalised coordinates back to the original file.
++function sourceOffsets(body: string): number[] {
++  const offsets = [0];
++  for (let i = 0; i < body.length; i++) {
++    if (body[i] === "\r" && body[i + 1] === "\n") i++;
++    offsets.push(i + 1);
++  }
++  return offsets;
++}
++
++// Use the Markdown parser that creates the rendered equations; a dollar in a
++// code fence, an escaped dollar or a literal price is not a formula anchor.
++// Refuse a range unless its original source can be mapped unambiguously.
++export function formulaSpans(body: string): FormulaSpan[] {
++  const front = splitFrontmatter(body).front.length;
++  const original = body.slice(front);
++  const source = normalizeNewlines(original);
++  const offsets = sourceOffsets(original);
++  const lines = [0];
++  for (let i = 0; i < source.length; i++) if (source[i] === "\n") lines.push(i + 1);
++  const absolute = (pos: number) => front + offsets[pos];
++  const out: FormulaSpan[] = [];
++  let row: [number, number] | null = null;
++  for (const token of markdown.parse(source, {})) {
++    if (token.type === "tr_open") row = token.map ?? null;
++    if (token.type === "tr_close") row = null;
++    const map = token.map ?? row;
++    if (!map) continue;
++    const blockStart = lines[map[0]];
++    const blockEnd = lines[map[1]] ?? source.length;
++    const block = source.slice(blockStart, blockEnd);
++    if (token.type === "inline") {
++      const first = block.indexOf(token.content);
++      if (first < 0 || block.indexOf(token.content, first + 1) >= 0) continue;
++      for (const child of token.children ?? []) {
++        if (child.type !== "fm_math_inline") continue;
++        const start = blockStart + first + child.meta.mathSourceStart;
++        const end = blockStart + first + child.meta.mathSourceEnd;
++        if (source.slice(start, end) !== "$" + child.content + "$") continue;
++        out.push({
++          kind: "inline", tex: child.content, start: absolute(start), end: absolute(end),
++          texStart: absolute(start + 1), texEnd: absolute(end - 1),
++        });
++      }
++      continue;
++    }
++    const mathFence = token.type === "fence" && token.info.trim() === "math";
++    if (token.type !== "fm_math_block" && !mathFence) continue;
++    const value = block.replace(/\n$/, "");
++    const tex = mathFence ? token.content.replace(/\n$/, "") : token.content;
++    const oneLine = !mathFence && !value.includes("\n");
++    const firstLine = value.split("\n", 1)[0];
++    const first = oneLine ? value.indexOf("$$") + 2 : firstLine.length + 1;
++    const last = oneLine ? value.lastIndexOf("$$") : value.lastIndexOf("\n");
++    const raw = value.slice(first, last);
++    const trim = oneLine ? raw.length - raw.trimStart().length : 0;
++    if ((oneLine ? raw.trim() : raw) !== tex || !tex) continue;
++    out.push({
++      kind: "display", tex, start: absolute(blockStart), end: absolute(blockStart + value.length),
++      texStart: absolute(blockStart + first + trim), texEnd: absolute(blockStart + first + trim + tex.length),
++    });
++  }
++  return out;
++}
++
++const context = (body: string, start: number, end: number) => ({
++  before: body.slice(Math.max(0, start - 64), start),
++  after: body.slice(end, end + 64),
++});
++
++export function formulaCommentFields(
++  body: string,
++  span: FormulaSpan,
++  from: number,
++  to: number,
++): Pick<Comment, "floating" | "anchor_text" | "formula_anchor"> {
++  if (from < 0 || to > span.tex.length || from >= to || !span.tex.slice(from, to).trim()) {
++    throw new Error("Select a nonempty LaTeX expression.");
++  }
++  const anchor: FormulaAnchor = {
++    kind: span.kind,
++    source: body.slice(span.start, span.end),
++    from,
++    to,
++    ...context(body, span.start, span.end),
++    unique: formulaSpans(body).filter((match) =>
++      match.kind === span.kind && body.slice(match.start, match.end) === body.slice(span.start, span.end),
++    ).length === 1,
++  };
++  return {
++    // A release without formula anchors can still read the comment.
++    floating: true,
++    anchor_text: span.tex.slice(from, to),
++    formula_anchor: anchor,
++  };
++}
++
++export function formulaAnchor(comment: Comment): FormulaAnchor | null {
++  return comment.formula_anchor ?? null;
++}
++
++export function resolveFormulaAnchor(body: string, comment: Comment, spans = formulaSpans(body)) {
++  const anchor = formulaAnchor(comment);
++  if (!anchor) return null;
++  const candidates = spans.filter((span) =>
++    span.kind === anchor.kind && body.slice(span.start, span.end) === anchor.source &&
++    anchor.to <= span.tex.length &&
++    span.tex.slice(anchor.from, anchor.to) === comment.anchor_text,
++  );
++  const sides = candidates.filter((span) => {
++    const around = context(body, span.start, span.end);
++    return around.before === anchor.before && around.after === anchor.after;
++  });
++  let span = sides.length === 1 ? sides[0] : null;
++  if (!span && anchor.unique && candidates.length === 1) {
++    const candidate = candidates[0];
++    const around = context(body, candidate.start, candidate.end);
++    if ((anchor.before && around.before.endsWith(anchor.before)) ||
++        (anchor.after && around.after.startsWith(anchor.after))) span = candidate;
++  }
++  if (!span) return null;
++  const tex = body.slice(span.texStart, span.texEnd);
++  const offsets = sourceOffsets(tex);
++  const from = span.texStart + offsets[anchor.from];
++  const to = span.texStart + offsets[anchor.to];
++  const line = body.slice(0, from).split("\n").length;
++  const column = from - body.lastIndexOf("\n", from - 1);
++  return { span, from, to, line, column, tex: body.slice(from, to) };
++}
++
++// The proposed replacement may change the selected TeX, but it must keep
++// the same formula delimiters and must still parse as exactly one equation.
++export function applyFormulaSuggestion(body: string, comment: Comment): string | null {
++  const selection = resolveFormulaAnchor(body, comment);
++  const suggestion = comment.suggested_edit;
++  if (!selection || !suggestion || selection.tex !== suggestion.from) return null;
++  const { from, to, span } = selection;
++  if (/<!--|\u0000/.test(suggestion.to)) return null;
++  const proposed = body.slice(0, from) + suggestion.to + body.slice(to);
++  const newEnd = span.end + suggestion.to.length - (to - from);
++  const tex = normalizeNewlines(
++    body.slice(span.texStart, from) + suggestion.to + body.slice(to, span.texEnd),
++  );
++  const stillFormula = formulaSpans(proposed).some((next) =>
++    next.kind === span.kind && next.start === span.start && next.end === newEnd && next.tex === tex,
++  );
++  return stillFormula ? proposed : null;
++}
++
++// Keep the request thread attached after its own proposal is accepted.
++// The archived proposal retains the original expression in suggested_edit.
++export function retargetFormulaRequest(
++  before: string,
++  after: string,
++  proposal: Comment,
++  request: Comment,
++): Comment {
++  const anchor = formulaAnchor(proposal);
++  const original = resolveFormulaAnchor(before, proposal);
++  if (!anchor || !original || !proposal.suggested_edit || !formulaAnchor(request) ||
++      request.id !== proposal.review_parent_id) return request;
++  const replacement = normalizeNewlines(proposal.suggested_edit.to);
++  const span = formulaSpans(after).find((next) => next.start === original.span.start && next.kind === anchor.kind);
++  if (!span) return request;
++  const from = replacement.trim() ? anchor.from : 0;
++  const to = replacement.trim() ? from + replacement.length : span.tex.length;
++  if (span.tex.slice(from, to) !== (replacement.trim() ? replacement : span.tex)) return request;
++  return { ...request, ...formulaCommentFields(after, span, from, to) };
++}
+diff --git a/src/format/markdownExtras.ts b/src/format/markdownExtras.ts
+--- a/src/format/markdownExtras.ts
++++ b/src/format/markdownExtras.ts
+@@ -263,6 +263,7 @@
+   if (!silent) {
+     const token = state.push("fm_math_inline", "span", 0);
+     token.content = src.slice(pos + 1, end);
++    token.meta = { mathSourceStart: pos, mathSourceEnd: end + 1 };
+   }
+   state.pos = end + 1;
+   return true;
+diff --git a/src/format/parser.ts b/src/format/parser.ts
+--- a/src/format/parser.ts
++++ b/src/format/parser.ts
+@@ -420,6 +420,33 @@
+ 
+   const replies = parseReplies(raw["replies"], idValue);
+   const suggestedEdit = parseSuggestedEdit(raw["suggested_edit"], idValue);
++  const reviewStatus = raw["review_status"];
++  const reviewedAt = raw["reviewed_at"];
++  const reviewedBy = raw["reviewed_by"];
++  const reviewParent = raw["review_parent_id"];
++  if (reviewStatus !== undefined) {
++    if (
++      (reviewStatus !== "accepted" && reviewStatus !== "rejected") ||
++      !suggestedEdit || resolved !== true || floating !== true ||
++      typeof reviewedAt !== "string" || !Number.isFinite(Date.parse(reviewedAt)) ||
++      typeof reviewedBy !== "string" || !reviewedBy.trim()
++    ) {
++      throw new ForgemarkParseError(
++        "schema",
++        `Comment id=${idValue}: invalid archived review decision`,
++      );
++    }
++  }
++  if (
++    reviewParent !== undefined &&
++    (typeof reviewParent !== "number" || !Number.isSafeInteger(reviewParent) ||
++      reviewParent < 1 || reviewParent === idValue || !suggestedEdit)
++  ) {
++    throw new ForgemarkParseError(
++      "schema",
++      `Comment id=${idValue}: 'review_parent_id' must identify another comment for a suggestion`,
++    );
++  }
+ 
+   // Forward-compat: capture unknown keys.
+   const known = new Set<string>(COMMENT_KEY_ORDER);
+@@ -440,6 +467,24 @@
+   };
+   if (floating === true) out.floating = true;
+   if (anchorFrontmatter === true) out.anchor_frontmatter = true;
++  const formula = raw["formula_anchor"];
++  if (formula !== undefined) {
++    const value = formula as Record<string, unknown> | null;
++    if (
++      !value || (value.kind !== "inline" && value.kind !== "display") ||
++      typeof value.source !== "string" || typeof value.before !== "string" ||
++      typeof value.after !== "string" || typeof value.unique !== "boolean" ||
++      typeof value.from !== "number" || typeof value.to !== "number" ||
++      !Number.isSafeInteger(value.from) || !Number.isSafeInteger(value.to) ||
++      value.from < 0 || value.to <= value.from || !floating
++    ) throw new ForgemarkParseError("schema", "Comment " + idValue + " has an invalid formula anchor.");
++    out.formula_anchor = {
++      kind: value.kind, from: value.from, to: value.to, unique: value.unique,
++      source: unescapeContent(value.source),
++      before: unescapeContent(value.before),
++      after: unescapeContent(value.after),
++    };
++  }
+   if (anchorText !== undefined) out.anchor_text = unescapeContent(anchorText);
+   if (anchorKind !== undefined) out.anchor_kind = anchorKind;
+   if (anchorSelector !== undefined) out.anchor_selector = unescapeContent(anchorSelector);
+@@ -449,6 +494,12 @@
+   if (editedAt !== undefined) out.edited_at = editedAt;
+   if (body !== undefined) out.body = unescapeContent(body);
+   if (suggestedEdit) out.suggested_edit = suggestedEdit;
++  if (reviewStatus === "accepted" || reviewStatus === "rejected") {
++    out.review_status = reviewStatus;
++    out.reviewed_at = reviewedAt as string;
++    out.reviewed_by = unescapeContent(reviewedBy as string);
++  }
++  if (typeof reviewParent === "number") out.review_parent_id = reviewParent;
+   if (replies.length > 0) out.replies = replies;
+   if (hasUnknown) out.additionalKeys = additionalKeys;
+ 
+diff --git a/src/format/reattach.ts b/src/format/reattach.ts
+--- a/src/format/reattach.ts
++++ b/src/format/reattach.ts
+@@ -41,6 +41,7 @@
+ import { DEFAULT_FORMAT } from "./types";
+ import { findMarkers, pairMarkers } from "./markers";
+ import { rankCandidates, type ReattachCandidate } from "./matching";
++import { formulaAnchor, formulaSpans, resolveFormulaAnchor } from "./formulaAnchors";
+ import { htmlCandidates } from "./html/candidates";
+ 
+ export type { ReattachCandidate } from "./matching";
+@@ -82,7 +83,16 @@
+   const { pairs } = pairMarkers(markers);
+   const pairById = new Map<number, (typeof pairs)[number]>();
+   for (const p of pairs) pairById.set(p.id, p);
++  const formulas = format === "markdown" && comments.some((c) => !c.review_status && formulaAnchor(c))
++    ? formulaSpans(body) : [];
+   for (const c of comments) {
++    if (!c.review_status && format === "markdown" && formulaAnchor(c)) {
++      const location = resolveFormulaAnchor(body, c, formulas);
++      out.set(c.id, location
++        ? { kind: "attached", from: location.from, to: location.to }
++        : { kind: "orphaned", candidates: [] });
++      continue;
++    }
+     if (c.floating) {
+       out.set(c.id, { kind: "floating" });
+       continue;
+diff --git a/src/format/types.ts b/src/format/types.ts
+--- a/src/format/types.ts
++++ b/src/format/types.ts
+@@ -17,6 +17,18 @@
+   from: string;
+   to: string;
+ };
++
++export type FormulaAnchor = {
++  kind: "inline" | "display";
++  source: string;
++  from: number;
++  to: number;
++  before: string;
++  after: string;
++  unique: boolean;
++};
++
++export type ReviewStatus = "accepted" | "rejected";
+ 
+ export type Comment = {
+   id: number;
+@@ -55,11 +67,22 @@
+   body?: string; // required for plain comments; optional with suggested_edit
+   replies?: Reply[];
+   suggested_edit?: SuggestedEdit;
++  // Finalized proposals retain their original diff and replies but carry no
++  // active markers. This keeps review history independent of live anchors.
++  review_status?: ReviewStatus;
++  reviewed_at?: string;
++  reviewed_by?: string;
++  // A suggestion may be linked to a different, original discussion thread.
++  review_parent_id?: number;
+   floating?: boolean;
+   // A comment on the Markdown front matter (`frontmatterAnchor.ts`): a
+   // floating note, since markers can't go in the YAML, that this version
+   // shows on the passage `anchor_text` quotes.
+   anchor_frontmatter?: boolean;
++  // Relative UTF-16 offsets into the formula's LF-normalised LaTeX.
++  // No marker ever goes inside TeX. An older version displays the record
++  // as a floating note and preserves this metadata.
++  formula_anchor?: FormulaAnchor;
+   // Forward-compat: unknown top-level fields preserved across round-trip.
+   additionalKeys?: Record<string, unknown>;
+ };
+@@ -94,6 +117,7 @@
+   "id",
+   "floating",
+   "anchor_frontmatter",
++  "formula_anchor",
+   "anchor_text",
+   "anchor_kind",
+   "anchor_selector",
+@@ -106,6 +130,10 @@
+   "resolved",
+   "body",
+   "suggested_edit",
++  "review_status",
++  "reviewed_at",
++  "reviewed_by",
++  "review_parent_id",
+   "replies",
+ ] as const;
+ 
+diff --git a/src/services/fileWatcher.ts b/src/services/fileWatcher.ts
+--- a/src/services/fileWatcher.ts
++++ b/src/services/fileWatcher.ts
+@@ -47,12 +47,15 @@
+   const debounceMs = opts.debounceMs ?? 200;
+   let timer: ReturnType<typeof setTimeout> | null = null;
+   let disposed = false;
++  let generation = 0;
++  const inDemo = Boolean((globalThis as { __FORGEMARK_DEMO__?: boolean }).__FORGEMARK_DEMO__);
+ 
+-  const fire = async () => {
++  const fire = async (expected: number) => {
+     if (disposed) return;
+     timer = null;
+     try {
+-      const snap = await snapshotFile(path);
++      const snap = inDemo ? await readDemoSnapshot() : await snapshotFile(path);
++      if (disposed || generation !== expected) return;
+       if (compareFingerprints(getBaseline(), snap.fingerprint) === "unchanged") return;
+       onChange(snap);
+     } catch (err) {
+@@ -72,13 +75,15 @@
+   // don't strictly need the payload — we re-read the file on every
+   // settled event — but we do filter so that unrelated changes in
+   // the parent dir don't trigger an extra read.
+-  const stopFn = await watch(
++  const interval = inDemo ? setInterval(() => void fire(++generation), 450) : null;
++  const stopFn = inDemo ? () => clearInterval(interval!) : await watch(
+     parentDir,
+     (event) => {
+       if (disposed) return;
+       if (!eventTouchesFile(event, fileName)) return;
+       if (timer) clearTimeout(timer);
+-      timer = setTimeout(fire, debounceMs);
++      const expected = ++generation;
++      timer = setTimeout(() => void fire(expected), debounceMs);
+     },
+     // The plugin debounces on its own, with a two-second default. That
+     // was the window in which the app's auto-save could overwrite an
+@@ -101,6 +106,16 @@
+       }
+     },
+   };
++}
++
++async function readDemoSnapshot(): Promise<WatcherEvent> {
++  // Do not update the browser transport's expected write hash from a
++  // background read. A save pins that hash in its own preflight read.
++  const response = await fetch("/__demo/document", { cache: "no-store" });
++  if (!response.ok) throw new Error("Couldn't poll the Demo file.");
++  const { text } = await response.json() as { text: string | null };
++  if (text === null) throw new Error("The Demo file is missing.");
++  return { text, fingerprint: await fingerprint(text, null) };
+ }
+ 
+ // The file as it is on disk right now: its bytes and their fingerprint.
+diff --git a/src/services/versionHistory.ts b/src/services/versionHistory.ts
+new file mode 100644
+--- /dev/null
++++ b/src/services/versionHistory.ts
+@@ -0,0 +1,226 @@
++import { exists, lstat, readTextFile, remove, rename, writeTextFile } from "@tauri-apps/plugin-fs";
++import { findMarkers, pairMarkers, parseForgemarkFile, replaceAnchoredText, serializeForgemarkFile, type DocFormat } from "../format";
++import { applyFormulaSuggestion, formulaAnchor, formulaCommentFields, formulaSpans, resolveFormulaAnchor } from "../format/formulaAnchors";
++import { saveDocument } from "./fileIO";
++
++export type SavedVersion = { id: string; at: string; before: string; after: string; state?: "staged" | "saved" };
++export type ApprovalVersion = SavedVersion & { commentId: number };
++
++const MAX_RECORDS = 20;
++const MAX_HISTORY_CHARACTERS = 8_000_000;
++const writes = new Map<string, Promise<void>>();
++
++export function versionHistoryPath(path: string): string {
++  return `${path}.forgemark-versions.json`;
++}
++
++export async function readVersionHistory(path: string): Promise<SavedVersion[]> {
++  const sidecar = versionHistoryPath(path);
++  if (!(await exists(sidecar))) return [];
++  const info = await lstat(sidecar);
++  if (!info.isFile || info.isSymlink) throw new Error("Version history must be a regular file.");
++  const data = JSON.parse(await readTextFile(sidecar));
++  if (data?.schema !== 1 || !Array.isArray(data.versions) || data.versions.some((item: SavedVersion) =>
++    !item || [item.id, item.at, item.before, item.after].some(value => typeof value !== "string") ||
++    (item.state !== undefined && item.state !== "staged" && item.state !== "saved") ||
++    !Number.isFinite(Date.parse(item.at)))) {
++    throw new Error("Version history has an unsupported format.");
++  }
++  return data.versions;
++}
++
++async function writeVersionHistory(path: string, versions: SavedVersion[]): Promise<void> {
++  const sidecar = versionHistoryPath(path);
++  const temp = `${sidecar}.${crypto.randomUUID()}.forgemark-tmp`;
++  try {
++    await writeTextFile(temp, JSON.stringify({ schema: 1, versions }) + "\n");
++    await rename(temp, sidecar);
++  } catch (error) {
++    try { await remove(temp); } catch { /* keep the original write error */ }
++    throw error;
++  }
++}
++
++/** Save in place with a durable before-image, using the same atomic document writer. */
++export async function saveVersionedDocument(
++  path: string,
++  text: string,
++  format: DocFormat | undefined,
++  expected: string | undefined,
++  defaultName?: string,
++): Promise<void> {
++  const preceding = writes.get(path) ?? Promise.resolve();
++  const current = preceding.catch(() => {}).then(async () => {
++    const before = (await exists(path)) ? await readTextFile(path) : undefined;
++    if (expected !== undefined && before !== undefined && before !== expected) {
++      throw new Error("The file changed on disk. Reload it before saving this version.");
++    }
++    let staged: SavedVersion[] | undefined;
++    if (before !== undefined && before !== text) {
++      const previous = await readVersionHistory(path);
++      const latest = previous[0];
++      if (latest?.before !== before || latest.after !== text) {
++        let size = before.length + text.length;
++        const kept = previous.slice(0, MAX_RECORDS - 1).filter((version) => {
++          size += version.before.length + version.after.length;
++          return size <= MAX_HISTORY_CHARACTERS;
++        });
++        const record: SavedVersion = { id: crypto.randomUUID(), at: new Date().toISOString(), before, after: text, state: "staged" };
++        // Keep the newest before-image even for an unusually large document.
++        staged = [record, ...kept];
++        await writeVersionHistory(path, staged);
++      } else if (latest.state === "staged") {
++        staged = previous;
++      }
++      // The journal write above may take time. Recheck before touching the document.
++      if (await readTextFile(path) !== before) {
++        throw new Error("The file changed during backup. Reload it before saving.");
++      }
++    }
++    if (before !== text || format !== undefined) {
++      if (format === undefined) await saveDocument(path, text);
++      else await saveDocument(path, text, format, defaultName);
++      if (staged) {
++        const [record, ...older] = staged;
++        try {
++          await writeVersionHistory(path, [{ ...record, state: "saved" }, ...older]);
++        } catch (error) {
++          // The document is already saved and its prior bytes are on disk.
++          // A later read can verify the staged transition against the file.
++          console.warn("[forgemark] Could not mark version as committed", error);
++        }
++      }
++    }
++  });
++  writes.set(path, current);
++  try { await current; }
++  finally { if (writes.get(path) === current) writes.delete(path); }
++}
++
++export function versionIsCommitted(version: SavedVersion, current: string, versions: SavedVersion[]): boolean {
++  return version.state !== "staged" || version.after === current ||
++    versions.some((later) => later.at >= version.at && later.id !== version.id && later.before === version.after);
++}
++
++function withoutMarkers(body: string, format: DocFormat) {
++  const markers = findMarkers(body, format);
++  let clean = "";
++  let previous = 0;
++  for (const marker of markers) {
++    clean += body.slice(previous, marker.start);
++    previous = marker.end;
++  }
++  clean += body.slice(previous);
++  return { clean, markers };
++}
++
++export function versionBody(text: string, format: DocFormat): string {
++  try {
++    return withoutMarkers(parseForgemarkFile(text, { tolerant: true, format }).body, format).clean.trimEnd();
++  } catch {
++    return text.trimEnd();
++  }
++}
++
++/** Recover individual approvals even when a single save recorded several. */
++export function versionApprovals(version: SavedVersion, format: DocFormat): ApprovalVersion[] {
++  try {
++    const before = parseForgemarkFile(version.before, { format });
++    const after = parseForgemarkFile(version.after, { format });
++    const approvals: ApprovalVersion[] = [];
++    for (const decision of after.comments) {
++      const previous = before.comments.find((item) => item.id === decision.id);
++      if (decision.review_status !== "accepted" || !decision.suggested_edit || !previous?.suggested_edit || previous.review_status) continue;
++      if (decision.suggested_edit.from !== previous.suggested_edit.from ||
++          decision.suggested_edit.to !== previous.suggested_edit.to) continue;
++      let body: string;
++      if (formulaAnchor(previous)) {
++        const replacement = applyFormulaSuggestion(before.body, previous);
++        if (replacement === null) continue;
++        body = replacement;
++      } else {
++        const replacement = replaceAnchoredText(before.body, decision.id, decision.suggested_edit.to, format);
++        if (!replacement || replacement.previousText !== previous.suggested_edit.from) continue;
++        body = replacement.body;
++      }
++      const isolated = serializeForgemarkFile({
++        body,
++        comments: before.comments.map((item) => item.id === decision.id ? decision : item),
++      });
++      approvals.push({
++        id: version.id + ":approval:" + decision.id,
++        at: decision.reviewed_at ?? version.at,
++        before: version.before,
++        after: isolated,
++        commentId: decision.id,
++      });
++    }
++    return approvals;
++  } catch {
++    return [];
++  }
++}
++
++export function versionDifference(before: string, after: string) {
++  let from = 0;
++  while (from < before.length && from < after.length && before[from] === after[from]) from++;
++  let beforeEnd = before.length;
++  let afterEnd = after.length;
++  while (beforeEnd > from && afterEnd > from && before[beforeEnd - 1] === after[afterEnd - 1]) {
++    beforeEnd--;
++    afterEnd--;
++  }
++  return { from, beforeEnd, afterEnd, removed: before.slice(from, beforeEnd), added: after.slice(from, afterEnd) };
++}
++
++/** Reverse one recorded body change only if its new text and context are still unique. */
++export function revertVersionChange(current: string, version: SavedVersion | ApprovalVersion, format: DocFormat): string {
++  const versionProse = (text: string) => withoutMarkers(parseForgemarkFile(text, { format }).body, format).clean.trimEnd();
++  const before = versionProse(version.before);
++  const after = versionProse(version.after);
++  const { from, afterEnd, added, removed } = versionDifference(before, after);
++  if (added === removed) throw new Error("This version contains review metadata changes only.");
++
++  const parsed = parseForgemarkFile(current, { format });
++  const { clean, markers } = withoutMarkers(parsed.body, format);
++  const left = after.slice(Math.max(0, from - 48), from);
++  const right = after.slice(afterEnd, afterEnd + 48);
++  const needle = left + added + right;
++  const position = needle ? clean.indexOf(needle) : -1;
++  if (position === -1 || clean.indexOf(needle, position + 1) !== -1) {
++    throw new Error("The saved passage no longer matches uniquely. The current file was preserved.");
++  }
++  function rawOffset(offset: number, afterMarker: boolean): number {
++    let hidden = 0;
++    for (const marker of markers) {
++      const visible = marker.start - hidden;
++      if (visible > offset || (visible === offset && !afterMarker)) break;
++      hidden += marker.end - marker.start;
++    }
++    return offset + hidden;
++  }
++  const start = rawOffset(position + left.length, true);
++  const end = added.length ? rawOffset(position + left.length + added.length, false) : start;
++  if (pairMarkers(markers).pairs.some(pair => start < pair.close.end && end > pair.open.start)) {
++    throw new Error("This change intersects a current comment anchor. The current file was preserved.");
++  }
++  const body = parsed.body.slice(0, start) + removed + parsed.body.slice(end);
++  let comments = parsed.comments;
++  if ("commentId" in version && format === "markdown") {
++    const original = parseForgemarkFile(version.before, { format });
++    const proposal = original.comments.find(c => c.id === version.commentId);
++    const originalRequest = original.comments.find(c => c.id === proposal?.review_parent_id);
++    const originalAnchor = originalRequest && formulaAnchor(originalRequest);
++    const request = comments.find(c => c.id === originalRequest?.id);
++    const now = request && resolveFormulaAnchor(parsed.body, request);
++    if (request && originalAnchor && now && start >= now.span.texStart && end <= now.span.texEnd) {
++      const restored = formulaSpans(body).find(span =>
++        span.start === now.span.start && body.slice(span.start, span.end) === originalAnchor.source,
++      );
++      if (restored) comments = comments.map(c => c.id === request.id
++        ? { ...c, ...formulaCommentFields(body, restored, originalAnchor.from, originalAnchor.to) }
++        : c);
++    }
++  }
++  return serializeForgemarkFile({ body, comments });
++}
+diff --git a/src/state/DocumentBindings.tsx b/src/state/DocumentBindings.tsx
+--- a/src/state/DocumentBindings.tsx
++++ b/src/state/DocumentBindings.tsx
+@@ -4,6 +4,7 @@
+ import { anyDirty, type DocId } from "./workspace";
+ import { invoke } from "@tauri-apps/api/core";
+ import { openDocuments, saveDocument, readDocument, type OpenedFile } from "../services/fileIO";
++import { saveVersionedDocument } from "../services/versionHistory";
+ import {
+   parseForgemarkFile,
+   recoverForgemarkFile,
+@@ -134,10 +135,10 @@
+   // Surface bytes found on disk that differ from what we last read or
+   // wrote. Shared by the watcher and by the pre-write check below.
+   const reportExternalChange = useCallback(
+-    (text: string, fp: FileFingerprint) => {
++    (text: string, fp: FileFingerprint, autoReload = false) => {
+       try {
+         const parsed = parseForgemarkFile(text, {
+-          tolerant: true,
++          tolerant: !autoReload,
+           format: stateRef.current.format,
+         });
+         dispatch({
+@@ -146,6 +147,7 @@
+           body: parsed.body,
+           comments: parsed.comments,
+           fingerprint: fp,
++          autoReload,
+         });
+       } catch (err) {
+         dispatch({
+@@ -299,7 +301,9 @@
+       // explicit answer, and Save As picks a destination the user chose.
+       if (seedPath && !opts.overwrite && (await diskChangedSinceBaseline(seedPath))) return false;
+       try {
+-        const path = await saveDocument(seedPath, text, s.format, chosenTarget(s.fileName));
++        let path = seedPath;
++        if (path) await saveVersionedDocument(path, text, s.format, opts.overwrite ? undefined : s.originalText, chosenTarget(s.fileName));
++        else path = await saveDocument(null, text, s.format, chosenTarget(s.fileName));
+         if (!path) return false; // user cancelled save dialog
+         if (path !== s.filePath && isOpenElsewhere(path)) {
+           // Two tabs on one path would run two watchers and two auto-save
+@@ -531,7 +535,7 @@
+         const text =
+           state.sourceDraft ??
+           serializeForgemarkFile({ body: state.body, comments: state.comments });
+-        await saveDocument(path, text);
++        await saveVersionedDocument(path, text, undefined, state.originalText);
+         dispatch({ type: "saved", text, body: state.body, comments: state.comments });
+         await refreshBaseline(path, text);
+       } catch (err) {
+@@ -552,6 +556,7 @@
+     diskChangedSinceBaseline,
+     refreshBaseline,
+     state.sourceDraft,
++    state.originalText,
+   ]);
+ 
+   // Phase 10: pendingSave bridge. When the save-conflict modal's
+@@ -601,7 +606,7 @@
+         const w = await watchMarkdownFile(
+           path,
+           () => baselineRef.current,
+-          ({ text, fingerprint: fp }) => reportExternalChange(text, fp),
++          ({ text, fingerprint: fp }) => reportExternalChange(text, fp, true),
+         );
+         if (cancelled) {
+           await w.dispose();
+diff --git a/src/state/document.ts b/src/state/document.ts
+--- a/src/state/document.ts
++++ b/src/state/document.ts
+@@ -23,6 +23,7 @@
+ import type { ParsedFile } from "../format/types";
+ import { DEFAULT_FORMAT } from "../format/types";
+ import { removeMarkersFromBody } from "../format/compose";
++import { retargetFormulaRequest } from "../format/formulaAnchors";
+ import type { FileFingerprint } from "../services/conflict";
+ 
+ export type DocumentState = {
+@@ -224,6 +225,9 @@
+   | { kind: "all" }
+   | { kind: "open" }
+   | { kind: "resolved" }
++  | { kind: "pending" }
++  | { kind: "accepted" }
++  | { kind: "rejected" }
+   | { kind: "byMe" }
+   | { kind: "byAuthor"; author: string };
+ 
+@@ -315,8 +319,9 @@
+   | { type: "undoDelete" }
+   | { type: "dismissUndoDelete" }
+   | { type: "deleteReply"; commentId: number; replyIndex: number }
+-  | { type: "acceptSuggestion"; commentId: number; body: string }
+-  | { type: "rejectSuggestion"; commentId: number; body: string }
++  | { type: "restoreVersion"; text: string; expected: string }
++  | { type: "acceptSuggestion"; commentId: number; body: string; reviewedAt: string; reviewer: string }
++  | { type: "rejectSuggestion"; commentId: number; body: string; reviewedAt: string; reviewer: string }
+   | {
+       type: "reattachComment";
+       commentId: number;
+@@ -345,6 +350,7 @@
+       comments: Comment[];
+       fingerprint: FileFingerprint;
+       parseError?: string;
++      autoReload?: boolean;
+     }
+   | { type: "dismissExternalChange" }
+   | { type: "applyExternalChange" }
+@@ -448,6 +454,29 @@
+         body: action.body,
+         dirty: true,
+       };
++    case "restoreVersion": {
++      if (!state.filePath || state.dirty || state.readOnly || state.externalChange ||
++          state.originalText !== action.expected || action.text === state.originalText) return state;
++      try {
++        const restored = parseForgemarkFile(action.text, { format: state.format });
++        return {
++          ...state,
++          body: restored.body,
++          comments: restored.comments,
++          sourceDraft: action.text,
++          viewMode: "source",
++          dirty: true,
++          loadGeneration: state.loadGeneration + 1,
++          focusedCommentId: null,
++          hoveredCommentId: null,
++          composer: null,
++          reattachTarget: null,
++          error: null,
++        };
++      } catch (err) {
++        return { ...state, error: "Could not restore the snapshot: " + (err instanceof Error ? err.message : String(err)) };
++      }
++    }
+     case "saved": {
+       // A keystroke or comment that landed while the write was in flight
+       // is not on disk. Keep it, and keep the document dirty so the next
+@@ -515,8 +544,14 @@
+     case "setHoveredComment":
+       if (state.hoveredCommentId === action.id) return state;
+       return { ...state, hoveredCommentId: action.id };
+-    case "openComposer":
+-      return { ...state, composer: action.composer };
++    case "openComposer": {
++      const composer = action.composer;
++      if (
++        "commentId" in composer &&
++        state.comments.some((c) => c.id === composer.commentId && c.review_status)
++      ) return state;
++      return { ...state, composer };
++    }
+     case "closeComposer":
+       return { ...state, composer: null };
+     case "addComment":
+@@ -575,6 +610,7 @@
+     }
+     case "toggleResolved": {
+       const target = state.comments.find((c) => c.id === action.commentId);
++      if (target?.review_status) return state;
+       const willBeResolved = !(target?.resolved ?? false);
+       const comments = state.comments.map((c) =>
+         c.id === action.commentId ? { ...c, resolved: !c.resolved } : c,
+@@ -591,11 +627,12 @@
+     }
+     case "setResolved": {
+       const ids = new Set(action.commentIds);
+-      if (!state.comments.some((c) => ids.has(c.id) && c.resolved !== action.resolved)) {
++      const changes = (c: Comment) => ids.has(c.id) && !c.review_status && c.resolved !== action.resolved;
++      if (!state.comments.some(changes)) {
+         return state;
+       }
+       const comments = state.comments.map((c) =>
+-        ids.has(c.id) && c.resolved !== action.resolved ? { ...c, resolved: action.resolved } : c,
++        changes(c) ? { ...c, resolved: action.resolved } : c,
+       );
+       const focusedCommentId =
+         action.resolved && state.focusedCommentId != null && ids.has(state.focusedCommentId)
+@@ -605,6 +642,9 @@
+     }
+     case "deleteComment": {
+       const deleted = state.comments.find((c) => c.id === action.commentId);
++      if (deleted?.review_status || state.comments.some((c) => c.review_parent_id === action.commentId)) {
++        return { ...state, error: "This comment is retained as part of the review history." };
++      }
+       // The markers go with the record. Computed here rather than by the
+       // caller, so no caller can hand over a body that disagrees with
+       // the comment change.
+@@ -648,26 +688,41 @@
+       return { ...state, comments, dirty: true, composer: null };
+     }
+     case "acceptSuggestion":
+-    case "rejectSuggestion":
+-      // Both terminal (per proposal §117): remove the comment and update
+-      // the body. Caller computed the new body — accept replaces the
+-      // anchored text with `to`; reject leaves the anchored text in place
+-      // and just strips the markers.
++    case "rejectSuggestion": {
++      const target = state.comments.find((c) => c.id === action.commentId);
++      if (!target?.suggested_edit || target.review_status) return state;
++      // Approval keeps the proposal and its discussion. The caller has
++      // removed the live markers and replaced the text only on acceptance.
+       return {
+         ...state,
+         body: action.body,
+-        comments: state.comments.filter((c) => c.id !== action.commentId),
++        comments: state.comments.map((c) =>
++          c.id === action.commentId
++            ? {
++                ...c,
++                floating: true,
++                resolved: true,
++                review_status: action.type === "acceptSuggestion" ? "accepted" : "rejected",
++                reviewed_at: action.reviewedAt,
++                reviewed_by: action.reviewer,
++              }
++            : action.type === "acceptSuggestion" && c.id === target.review_parent_id && target.formula_anchor
++              ? retargetFormulaRequest(state.body, action.body, target, c)
++              : c,
++        ),
+         dirty: true,
+         focusedCommentId:
+           state.focusedCommentId === action.commentId ? null : state.focusedCommentId,
+         composer: null,
+       };
++    }
+     case "reattachComment": {
+       const comments = state.comments.map((c) =>
+         c.id === action.commentId
+           ? {
+               ...c,
+               floating: undefined,
++              formula_anchor: undefined,
+               anchor_text: action.anchor_text,
+               context_before: action.context_before,
+               context_after: action.context_after,
+@@ -704,6 +759,7 @@
+         const next: typeof c = {
+           ...c,
+           floating: true,
++          formula_anchor: undefined,
+           anchor_text: undefined,
+           context_before: undefined,
+           context_after: undefined,
+@@ -725,6 +781,30 @@
+     case "closeReattach":
+       return { ...state, reattachTarget: null };
+     case "externalChangeDetected":
++      if (action.autoReload && action.text === state.originalText) return state;
++      if (
++        action.autoReload &&
++        !action.parseError &&
++        !state.dirty &&
++        (state.sourceDraft == null || state.sourceDraft === state.originalText) &&
++        !state.composer &&
++        state.reattachTarget == null &&
++        !state.externalChange
++      ) {
++        return {
++          ...state,
++          originalText: action.text,
++          body: action.body,
++          comments: action.comments,
++          sourceDraft: state.viewMode === "source" ? action.text : null,
++          loadGeneration: state.loadGeneration + Number(action.body !== state.body),
++          focusedCommentId: action.comments.some((c) => c.id === state.focusedCommentId)
++            ? state.focusedCommentId
++            : null,
++          hoveredCommentId: null,
++          lastDeleted: null,
++        };
++      }
+       return {
+         ...state,
+         externalChange: {
+diff --git a/tests/integration/file-conflict.test.tsx b/tests/integration/file-conflict.test.tsx
+--- a/tests/integration/file-conflict.test.tsx
++++ b/tests/integration/file-conflict.test.tsx
+@@ -13,6 +13,7 @@
+ );
+ 
+ vi.mock("@tauri-apps/plugin-fs", () => ({
++  exists: async (path: string) => path === "/tmp/x.md",
+   readTextFile: (...args: unknown[]) => readTextFileMock(...(args as [])),
+   writeTextFile: (...args: unknown[]) => writeTextFileMock(...(args as [])),
+   rename: vi.fn(() => Promise.resolve()),
+diff --git a/tests/integration/file-open.test.tsx b/tests/integration/file-open.test.tsx
+--- a/tests/integration/file-open.test.tsx
++++ b/tests/integration/file-open.test.tsx
+@@ -18,6 +18,7 @@
+ }));
+ 
+ vi.mock("@tauri-apps/plugin-fs", () => ({
++  exists: async (path: string) => !path.endsWith(".forgemark-versions.json"),
+   readTextFile: (...args: unknown[]) => mockReadTextFile(...args),
+   writeTextFile: (...args: unknown[]) => mockWriteTextFile(...args),
+   rename: vi.fn(() => Promise.resolve()),
+diff --git a/tests/integration/formula-comments.test.tsx b/tests/integration/formula-comments.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/tests/integration/formula-comments.test.tsx
+@@ -0,0 +1,50 @@
++import { fireEvent, screen, waitFor } from "@testing-library/react";
++import { expect, it } from "vitest";
++import { renderApp } from "../utils/harness";
++import { useDocument } from "../../src/state/DocumentProvider";
++import { formulaCommentFields, formulaSpans, resolveFormulaAnchor } from "../../src/format/formulaAnchors";
++import { suggestFormula } from "../../cli/lib";
++
++const body = "An inline formula $x_i+x_j$.\n\n$$\nT=x_i+x_j\n$$\n";
++
++function Probe() {
++  const { state } = useDocument();
++  const comment = state.comments[0];
++  const range = comment && resolveFormulaAnchor(state.body, comment);
++  return <output data-testid="formula-probe">{range ? [range.tex, range.line, range.column].join("|") : ""}</output>;
++}
++
++it("opens a clickable formula's exact source, annotates a subexpression and leaves TeX intact", async () => {
++  renderApp({ load: { body }, probe: <Probe /> });
++  await waitFor(() => expect(document.querySelector(".fm-math-block")).not.toBeNull());
++  fireEvent.click(document.querySelector(".fm-math-block .katex")!);
++  const dialog = await screen.findByTestId("fm-formula-comment");
++  const tex = screen.getByLabelText("LaTeX source") as HTMLTextAreaElement;
++  expect(tex.value).toBe("T=x_i+x_j");
++  tex.focus();
++  tex.setSelectionRange(6, 9);
++  fireEvent.select(tex);
++  fireEvent.change(screen.getByLabelText("Comment"), { target: { value: "Check the second term." } });
++  fireEvent.click(screen.getByRole("button", { name: "Save comment" }));
++  expect(dialog.isConnected).toBe(false);
++  expect(screen.getByTestId("formula-probe").textContent).toBe("x_j|4|7");
++  expect(document.querySelector(".fm-math-block")?.getAttribute("data-fm-math-block")).toBe("T=x_i+x_j");
++});
++
++it("keeps the request attached and archives the selected replacement after human approval", async () => {
++  const now = "2026-11-08T01:00:00Z";
++  const file = suggestFormula({
++    body,
++    comments: [{
++      id: 1, author: "Reviewer", timestamp: now, resolved: false, body: "Check the exponent.",
++      ...formulaCommentFields(body, formulaSpans(body)[0], 0, 3),
++    }],
++  }, 1, { author: "Codex", replacement: "x_k", now }).file;
++  renderApp({ load: file, probe: <Probe /> });
++  fireEvent.click(await screen.findByTestId("fm-card-2"));
++  fireEvent.click(await screen.findByTestId("fm-card-accept-2"));
++  expect(screen.getByTestId("fm-card-2")).toHaveAttribute("data-review-status", "accepted");
++  expect(screen.getByTestId("formula-probe").textContent).toBe("x_k|1|20");
++  expect(document.querySelector(".fm-math")?.getAttribute("data-fm-math")).toBe("x_k+x_j");
++  expect(document.querySelector(".fm-math-block")?.getAttribute("data-fm-math-block")).toBe("T=x_i+x_j");
++});
+diff --git a/tests/integration/save-guard.test.tsx b/tests/integration/save-guard.test.tsx
+--- a/tests/integration/save-guard.test.tsx
++++ b/tests/integration/save-guard.test.tsx
+@@ -25,6 +25,7 @@
+ );
+ 
+ vi.mock("@tauri-apps/plugin-fs", () => ({
++  exists: async (path: string) => path === "/tmp/guard.md",
+   readTextFile: (...args: unknown[]) => readTextFileMock(...(args as [])),
+   writeTextFile: (...args: unknown[]) => writeTextFileMock(...(args as [])),
+   rename: vi.fn(() => Promise.resolve()),
+diff --git a/tests/integration/suggestion-actions.test.tsx b/tests/integration/suggestion-actions.test.tsx
+--- a/tests/integration/suggestion-actions.test.tsx
++++ b/tests/integration/suggestion-actions.test.tsx
+@@ -5,6 +5,7 @@
+ import { DocumentProvider, useDocument } from "../../src/state/DocumentProvider";
+ import { AppShell } from "../../src/components/AppShell";
+ import type { Comment } from "../../src/format/types";
++import { parseForgemarkFile, serializeForgemarkFile } from "../../src/format";
+ 
+ beforeEach(() => {
+   window.localStorage.clear();
+@@ -43,6 +44,7 @@
+     <div>
+       <span data-testid="probe-body">{state.body}</span>
+       <span data-testid="probe-comment-count">{state.comments.length}</span>
++      <span data-testid="probe-comments">{JSON.stringify(state.comments)}</span>
+       <span data-testid="probe-error">{state.error ?? "none"}</span>
+       <span data-testid="probe-dirty">{state.dirty ? "dirty" : "clean"}</span>
+     </div>
+@@ -87,18 +89,39 @@
+     expect(screen.queryByTestId("fm-card-resolve-1")).not.toBeInTheDocument();
+   });
+ 
+-  it("Accept replaces the anchored text and removes the comment", async () => {
+-    renderApp({
+-      body: "x <!-- fmc:1 -->old phrase<!-- /fmc:1 --> y\n",
+-      comments: [aSuggestion()],
++  it("Accept replaces only the anchored text and archives the complete proposal", async () => {
++    const reply = { author: "Codex", timestamp: "2026-05-07T10:00:00Z", body: "Reviewed." };
++    renderApp({
++      body: "x <!-- fmc:1 -->old phrase<!-- /fmc:1 --> <!-- fmc:2 -->y<!-- /fmc:2 -->\n\n",
++      comments: [
++        aSuggestion({ review_parent_id: 2, replies: [reply] }),
++        { id: 2, author: "Maya", timestamp: reply.timestamp, resolved: false, anchor_text: "y", body: "Please revise." },
++      ],
+     });
+     const card = await screen.findByTestId("fm-card-1");
+     fireEvent.click(card);
+     fireEvent.click(await screen.findByTestId("fm-card-accept-1"));
+     await waitFor(() => {
+-      expect(screen.getByTestId("probe-comment-count").textContent).toBe("0");
+-    });
+-    expect(screen.getByTestId("probe-body").textContent).toBe("x new phrase y\n");
++      expect(screen.getByTestId("fm-card-1")).toHaveAttribute("data-review-status", "accepted");
++    });
++    const body = screen.getByTestId("probe-body").textContent!;
++    const comments = JSON.parse(screen.getByTestId("probe-comments").textContent!);
++    expect(body).toBe("x new phrase <!-- fmc:2 -->y<!-- /fmc:2 -->\n\n");
++    const back = parseForgemarkFile(serializeForgemarkFile({ body, comments }));
++    expect(back.comments).toEqual(comments);
++    expect(back.comments[0]).toMatchObject({
++      review_status: "accepted",
++      reviewed_by: "Maya",
++      review_parent_id: 2,
++      replies: [reply],
++      suggested_edit: { from: "old phrase", to: "new phrase" },
++    });
++    fireEvent.change(screen.getByTestId("fm-sidebar-filter"), { target: { value: "accepted" } });
++    expect(screen.queryByTestId("fm-card-2")).not.toBeInTheDocument();
++    fireEvent.click(screen.getByTestId("fm-card-1"));
++    expect(screen.queryByTestId("fm-card-accept-1")).not.toBeInTheDocument();
++    fireEvent.click(screen.getByRole("button", { name: "Original thread #2" }));
++    expect(screen.getByTestId("fm-card-2")).toHaveAttribute("aria-current", "true");
+     expect(screen.getByTestId("probe-dirty").textContent).toBe("dirty");
+   });
+ 
+@@ -120,7 +143,7 @@
+     expect(screen.getByTestId("probe-comment-count").textContent).toBe("1");
+   });
+ 
+-  it("Reject leaves the anchored text but removes the comment + markers", async () => {
++  it("Reject leaves the anchored text and archives the proposal without markers", async () => {
+     renderApp({
+       body: "x <!-- fmc:1 -->old phrase<!-- /fmc:1 --> y\n",
+       comments: [aSuggestion()],
+@@ -129,11 +152,15 @@
+     fireEvent.click(card);
+     fireEvent.click(await screen.findByTestId("fm-card-reject-1"));
+     await waitFor(() => {
+-      expect(screen.getByTestId("probe-comment-count").textContent).toBe("0");
++      expect(screen.getByTestId("fm-card-1")).toHaveAttribute("data-review-status", "rejected");
+     });
+     // The anchored text stays; only the markers are stripped.
+     expect(screen.getByTestId("probe-body").textContent).toBe("x old phrase y\n");
+     expect(screen.getByTestId("probe-dirty").textContent).toBe("dirty");
++    fireEvent.change(screen.getByTestId("fm-sidebar-filter"), { target: { value: "pending" } });
++    expect(screen.queryByTestId("fm-card-1")).not.toBeInTheDocument();
++    fireEvent.change(screen.getByTestId("fm-sidebar-filter"), { target: { value: "rejected" } });
++    expect(screen.getByTestId("fm-card-1")).toBeInTheDocument();
+   });
+ 
+   it("Accept on a `from` mismatch surfaces an error (suggestion drift)", async () => {
+diff --git a/tests/unit/cli/lib.test.ts b/tests/unit/cli/lib.test.ts
+--- a/tests/unit/cli/lib.test.ts
++++ b/tests/unit/cli/lib.test.ts
+@@ -89,6 +89,7 @@
+       author: "Claude",
+       anchor: "controlling for company size",
+       suggest: "adjusting for company size",
++      reviewParentId: 1,
+       now: NOW,
+     });
+     const c = r.file.comments.at(-1)!;
+@@ -97,6 +98,8 @@
+       to: "adjusting for company size",
+     });
+     expect(c.body).toBeUndefined();
++    expect(c.review_parent_id).toBe(1);
++    expect(() => deleteComment(r.file, 1)).toThrow(/review history/);
+     roundTrips(r.file);
+   });
+ 
+diff --git a/tests/unit/document.test.ts b/tests/unit/document.test.ts
+--- a/tests/unit/document.test.ts
++++ b/tests/unit/document.test.ts
+@@ -267,6 +267,27 @@
+     const typed = reduceDocument(loaded, { type: "edit", body: "alpha and more" });
+     expect(typed.loadGeneration).toBe(loaded.loadGeneration);
+   });
++
++  it("reloads validated watcher updates only when the buffer is safe", () => {
++    const loaded = reduceDocument(INITIAL_STATE, baseLoad);
++    const update = {
++      type: "externalChangeDetected" as const,
++      text: "new disk text",
++      body: "new disk text",
++      comments: [],
++      fingerprint: { mtimeMs: null, hash: "changed" },
++      autoReload: true,
++    };
++    const clean = reduceDocument(loaded, update);
++    expect(clean.body).toBe(update.body);
++    expect(clean.externalChange).toBeNull();
++    expect(clean.loadGeneration).toBe(loaded.loadGeneration + 1);
++    const edited = reduceDocument(loaded, { type: "edit", body: "unsaved draft" });
++    const conflict = reduceDocument(edited, update);
++    expect(conflict.body).toBe("unsaved draft");
++    expect(conflict.externalChange?.text).toBe(update.text);
++    expect(reduceDocument(loaded, { ...update, parseError: "invalid" }).body).toBe(loaded.body);
++  });
+ });
+ 
+ describe("document reducer — editing the source", () => {
+diff --git a/tests/unit/format/formula-anchors.test.ts b/tests/unit/format/formula-anchors.test.ts
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/format/formula-anchors.test.ts
+@@ -0,0 +1,68 @@
++import { describe, expect, it } from "vitest";
++import { applyFormulaSuggestion, formulaCommentFields, formulaSpans, resolveFormulaAnchor } from "../../../src/format/formulaAnchors";
++import { parseForgemarkFile } from "../../../src/format/parser";
++import { serializeForgemarkFile } from "../../../src/format/serializer";
++import type { Comment } from "../../../src/format/types";
++import { listComments, suggestFormula } from "../../../cli/lib";
++
++const now = "2026-11-08T01:00:00Z";
++
++function commentAt(body: string, index: number, from: number, to: number): Comment {
++  return {
++    id: 1, author: "Reviewer", timestamp: now, resolved: false, body: "Please check this term.",
++    ...formulaCommentFields(body, formulaSpans(body)[index], from, to),
++  };
++}
++
++describe("formula anchors", () => {
++  it("maps display, inline and fenced equations while ignoring literal code", () => {
++    const body = ["A formula $x^2$ and \x60$not_math$\x60.", "", "$$", "f(x)=x^2", "$$", "", "\x60\x60\x60math", "a+b", "\x60\x60\x60", ""].join("\n");
++    expect(formulaSpans(body).map(({ tex, kind, texStart, texEnd }) =>
++      [kind, tex, body.slice(texStart, texEnd)],
++    )).toEqual([
++      ["inline", "x^2", "x^2"],
++      ["display", "f(x)=x^2", "f(x)=x^2"],
++      ["display", "a+b", "a+b"],
++    ]);
++  });
++
++  it("preserves Markdown and uses the exact selected LaTeX source after round-trip", () => {
++    const body = "First $x_i + x_j$.\r\n\r\n$$\r\nT_i=x_i\r\n+ x_j\r\n$$\r\n\r\n";
++    const c = commentAt(body, 1, 8, 13);
++    const saved = parseForgemarkFile(serializeForgemarkFile({ body, comments: [c] }));
++    // The shared YAML serializer adds a separator before the comments block.
++    expect(saved.body).toBe(body + "\n");
++    expect(saved.comments[0].anchor_text).toBe("+ x_j");
++    const location = resolveFormulaAnchor(saved.body, saved.comments[0]);
++    expect(location).toMatchObject({ tex: "+ x_j", line: 5, column: 1 });
++    expect(listComments(saved, "markdown")[0]).toMatchObject({
++      status: "attached", current: "+ x_j", formulaLocation: { line: 5, column: 1 },
++    });
++  });
++
++  it("anchors the correct duplicate and refuses newly ambiguous copies", () => {
++    const body = "One: $x$. Two: $x$. Three: $x$.";
++    const c = commentAt(body, 1, 0, 1);
++    expect(resolveFormulaAnchor(body, c)?.from).toBe(body.indexOf("$x$", 10) + 1);
++    expect(resolveFormulaAnchor("New: $x$. Next: $x$.", c)).toBeNull();
++    expect(resolveFormulaAnchor("One: $x$.", c)).toBeNull();
++  });
++
++  it("creates a pending proposal and only applies exact matching TeX", () => {
++    const body = "A formula $x^2 + y$.\n";
++    const c = commentAt(body, 0, 0, 3);
++    const result = suggestFormula({ body, comments: [c] }, 1, {
++      author: "Codex", replacement: "x^3", now,
++    });
++    expect(result.file.body).toBe(body);
++    const suggestion = result.file.comments[1];
++    expect(suggestion).toMatchObject({
++      review_parent_id: 1, suggested_edit: { from: "x^2", to: "x^3" }, resolved: false,
++    });
++    expect(applyFormulaSuggestion(body, suggestion)).toBe("A formula $x^3 + y$.\n");
++    expect(applyFormulaSuggestion(body.replace("y", "z"), suggestion)).toBeNull();
++    expect(() => suggestFormula({ body, comments: [c] }, 1, {
++      author: "Codex", replacement: "x$ y", now,
++    })).toThrow(/preserves/);
++  });
++});
+diff --git a/tests/unit/versionHistory.test.ts b/tests/unit/versionHistory.test.ts
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/versionHistory.test.ts
+@@ -0,0 +1,151 @@
++import { expect, it } from "vitest";
++import { fakeTauri } from "../utils/harness";
++import {
++  readVersionHistory,
++  revertVersionChange,
++  saveVersionedDocument,
++  versionApprovals,
++  versionBody,
++  versionHistoryPath,
++  versionIsCommitted,
++  type SavedVersion,
++} from "../../src/services/versionHistory";
++import { insertMarkersIntoBody, parseForgemarkFile, serializeForgemarkFile, type Comment } from "../../src/format";
++import { INITIAL_STATE, reduceDocument } from "../../src/state/document";
++import { formulaCommentFields, formulaSpans, resolveFormulaAnchor, retargetFormulaRequest } from "../../src/format/formulaAnchors";
++
++const path = "/versions/draft.md";
++const at = "2026-11-08T00:00:00Z";
++const before = "# Methods\n\nPore pressure supplies the electrical input.\n\n";
++const after = before.replace("supplies", "provides");
++const version: SavedVersion = { id: "1", at, before, after };
++
++it("records the exact before and after bytes, then restores a saved version through the same path", async () => {
++  fakeTauri.seed(path, before);
++  await saveVersionedDocument(path, after, "markdown", before);
++  expect(await fakeTauri.fs.readTextFile(path)).toBe(after);
++  expect(await readVersionHistory(path)).toEqual([expect.objectContaining({ before, after })]);
++  await saveVersionedDocument(path, before, "markdown", after);
++  expect(await fakeTauri.fs.readTextFile(path)).toBe(before);
++  expect(await readVersionHistory(path)).toEqual([
++    expect.objectContaining({ before: after, after: before }),
++    expect.objectContaining({ before, after }),
++  ]);
++});
++
++it("refuses a stale save without overwriting the file or creating a history record", async () => {
++  fakeTauri.seed(path, "# Newer external edit\n");
++  await expect(saveVersionedDocument(path, after, "markdown", before)).rejects.toThrow("changed on disk");
++  expect(await fakeTauri.fs.readTextFile(path)).toBe("# Newer external edit\n");
++  expect(await fakeTauri.fs.exists(versionHistoryPath(path))).toBe(false);
++});
++
++it("refuses to overwrite a malformed version journal", async () => {
++  fakeTauri.seed(path, before);
++  fakeTauri.seed(versionHistoryPath(path), "Unexpected data");
++  await expect(saveVersionedDocument(path, after, "markdown", before)).rejects.toThrow();
++  expect(await fakeTauri.fs.readTextFile(path)).toBe(before);
++  expect(await fakeTauri.fs.readTextFile(versionHistoryPath(path))).toBe("Unexpected data");
++});
++
++it("retains a before-image without presenting a failed save as a committed version", async () => {
++  fakeTauri.seed(path, before);
++  const rename = fakeTauri.fs.rename.getMockImplementation()!;
++  fakeTauri.fs.rename.mockImplementation((from, to) =>
++    to === path ? Promise.reject(new Error("Document write refused")) : rename(from, to),
++  );
++  await expect(saveVersionedDocument(path, after, "markdown", before)).rejects.toThrow("write refused");
++  expect(await fakeTauri.fs.readTextFile(path)).toBe(before);
++  const records = await readVersionHistory(path);
++  expect(records[0]).toMatchObject({ state: "staged", before, after });
++  expect(versionIsCommitted(records[0], before, records)).toBe(false);
++});
++
++it("reverts only the changed source, preserving newer content and nearby review anchors", () => {
++  const start = after.indexOf("Pore pressure");
++  const comment: Comment = { id: 1, author: "Reviewer", timestamp: at, anchor_text: "Pore pressure", resolved: false, body: "Keep the mechanism." };
++  const body = insertMarkersIntoBody(after, start, start + comment.anchor_text!.length, 1);
++  const current = serializeForgemarkFile({ body: body + "Later edit.\n", comments: [comment] });
++  const restored = revertVersionChange(current, version, "markdown");
++  expect(versionBody(restored, "markdown")).toBe(before + "Later edit.");
++  expect(parseForgemarkFile(restored).comments).toEqual([comment]);
++});
++
++it("refuses restoration when the passage changed or its context occurs twice", () => {
++  expect(() => revertVersionChange(after.replace("provides", "feeds"), version, "markdown")).toThrow("no longer matches");
++  expect(() => revertVersionChange(after + after, version, "markdown")).toThrow("no longer matches");
++});
++
++it("derives a per-approval undo even when several approved changes share one save", () => {
++  const heading = "Alpha supplies input.";
++  const footer = "Beta supplies input.";
++  const middle = "\n\n" + "Stable explanatory text. ".repeat(5) + "\n\n";
++  const startBody = heading + middle + footer;
++  const comments: Comment[] = [heading, footer].map((value, index) => ({
++    id: index + 1,
++    author: "Codex",
++    timestamp: at,
++    resolved: false,
++    anchor_text: value,
++    suggested_edit: { from: value, to: value.replace("supplies", "provides") },
++  }));
++  let withMarkers = startBody;
++  for (const c of comments.slice().reverse()) {
++    const start = withMarkers.indexOf(c.anchor_text!);
++    withMarkers = insertMarkersIntoBody(withMarkers, start, start + c.anchor_text!.length, c.id);
++  }
++  const approvals = comments.map((c) => ({
++    ...c, resolved: true, floating: true, review_status: "accepted" as const, reviewed_at: at, reviewed_by: "Reviewer",
++  }));
++  const saved = {
++    id: "two-approvals",
++    at,
++    before: serializeForgemarkFile({ body: withMarkers, comments }),
++    after: serializeForgemarkFile({ body: startBody.replaceAll("supplies", "provides"), comments: approvals }),
++  };
++  const decisions = versionApprovals(saved, "markdown");
++  expect(decisions.map((d) => d.commentId)).toEqual([1, 2]);
++  const restored = revertVersionChange(saved.after, decisions[0], "markdown");
++  expect(versionBody(restored, "markdown")).toBe(heading + middle + footer.replace("supplies", "provides"));
++  expect(parseForgemarkFile(restored).comments).toEqual(approvals);
++});
++
++it("derives and reverses an approved formula change without moving the historical record", () => {
++  const math = "# Example\n\nUse $x^2$ in this test.\n";
++  const request: Comment = {
++    id: 1, author: "Reviewer", timestamp: at, resolved: false, body: "Please review the exponent.",
++    ...formulaCommentFields(math, formulaSpans(math)[0], 0, 3),
++  };
++  const proposal: Comment = {
++    id: 2, author: "Codex", timestamp: at, resolved: false, review_parent_id: 1,
++    ...formulaCommentFields(math, formulaSpans(math)[0], 0, 3),
++    suggested_edit: { from: "x^2", to: "x^3" },
++  };
++  const approval: Comment = {
++    ...proposal, resolved: true, review_status: "accepted", reviewed_at: at, reviewed_by: "Reviewer",
++  };
++  const changed = math.replace("x^2", "x^3");
++  const saved = {
++    id: "formula",
++    at,
++    before: serializeForgemarkFile({ body: math, comments: [request, proposal] }),
++    after: serializeForgemarkFile({ body: changed, comments: [retargetFormulaRequest(math, changed, proposal, request), approval] }),
++  };
++  const [decision] = versionApprovals(saved, "markdown");
++  expect(decision.commentId).toBe(2);
++  const restored = revertVersionChange(saved.after, decision, "markdown");
++  expect(versionBody(restored, "markdown")).toBe(math.trimEnd());
++  const parsed = parseForgemarkFile(restored);
++  expect(parsed.comments[0]).toMatchObject({ id: request.id, body: request.body, anchor_text: "x^2" });
++  expect(resolveFormulaAnchor(parsed.body, parsed.comments[0])?.tex).toBe("x^2");
++  expect(parsed.comments[1]).toEqual(approval);
++});
++
++it("only stages a version restore against the unchanged clean tab", () => {
++  const clean = { ...INITIAL_STATE, filePath: path, originalText: after, body: after };
++  const action = { type: "restoreVersion" as const, text: before, expected: after };
++  const dirty = { ...clean, dirty: true };
++  expect(reduceDocument(dirty, action)).toBe(dirty);
++  expect(reduceDocument(clean, { ...action, expected: "Older view" })).toBe(clean);
++  expect(reduceDocument(clean, action)).toMatchObject({ sourceDraft: before, dirty: true, viewMode: "source" });
++});

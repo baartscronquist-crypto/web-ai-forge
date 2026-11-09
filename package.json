@@ -1,0 +1,16 @@
+{
+  "name": "web-ai-forge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bring a ChatGPT Web editorial pass back into Markdown as changes you can review and approve.",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "demo": "node src/start.mjs",
+    "start": "node src/start.mjs",
+    "test": "node --test scripts/demo-smoke.test.mjs"
+  }
+}
